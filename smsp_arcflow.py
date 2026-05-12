@@ -31,7 +31,9 @@ Usage
   python smsp_arcflow.py --folder path/to/LOW --out_csv r.csv --out_sol sol/
 """
 
+
 from __future__ import annotations
+import warnings
 import argparse, csv, math, os, re, time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -290,6 +292,13 @@ class ArcFlowReflectSMSP:
         self.verbose    = verbose
         self.threads    = threads
         self.machines   = machines
+        """
+        if two_phase and machines > 1:
+            warnings.warn(
+                "two_phase=True is only valid for machines=1. "
+                "Falling back to single-phase for parallel machines.",
+                UserWarning, stacklevel=2)
+            two_phase = False"""
         self.two_phase  = two_phase
         self.graph      = ReflectGraph(inst)
         self._model     = None
@@ -351,7 +360,11 @@ class ArcFlowReflectSMSP:
                 m.addConstr(flow_t + quicksum(y[t, k] for k in M) == inst.item_types[t],
                             name=f"dem_{t}")
             else:
-                m.addConstr(flow_t + y[t] == inst.item_types[t], name=f"dem_{t}")
+                if y is None:
+                    m.addConstr(flow_t == inst.item_types[t], name=f"dem_{t}")
+                else:
+                    m.addConstr(flow_t + y[t] == inst.item_types[t], name=f"dem_{t}")
+
 
     def _add_z_lower_bound(self, m: gp.Model, z_expr):
         """Optional lower bound on z derived from total load."""
@@ -360,10 +373,7 @@ class ArcFlowReflectSMSP:
         full_bin_load = inst.full_bin_count * inst.T
         partial_load  = total_load - full_bin_load
         T = inst.T
-        if self.machines > 1:
-            z_lb = max(0, math.ceil(partial_load / (T * self.machines)) - 1)
-        else:
-            z_lb = max(0, math.ceil(partial_load / T) - 1)
+        z_lb = max(0, math.ceil(partial_load / T) -self.machines)
         m.addConstr(z_expr >= z_lb, name="z_lb")
 
     # ------------------------------------------------------------------
@@ -394,7 +404,9 @@ class ArcFlowReflectSMSP:
 
         if self.machines > 1:
             y  = {(t, k): m.addVar(vtype=GRB.INTEGER, lb=0, ub=d, name=f"y_{t}_{k}")
-                  for t, d in inst.item_types.items() for k in M}
+                  for t, d in inst.item_types.items() for k in M if k>0}
+            for t, d in inst.item_types.items():
+                y[t,0] = m.addVar(vtype=GRB.CONTINUOUS, lb=0, ub=d, name=f"y_{t}_0")
             u  = {(t, k): m.addVar(vtype=GRB.INTEGER, lb=0, ub=d, name=f"u_{t}_{k}")
                   for t, d in inst.item_types.items() for k in M}
             for k in M:
@@ -436,10 +448,22 @@ class ArcFlowReflectSMSP:
                     name=f"cmax_{k}")
                 # Symmetry-breaking
                 if k > 0:
+                    for k in M[1:]:
+                        total_bins_k = (quicksum(u[t, k] for t in inst.item_types)
+                                        + u[-1, k] + ub[k])
+                        total_bins_k_min_1 = (quicksum(u[t,k-1] for t in inst.item_types)
+                                        + u[-1, k] + ub[k-1])
+                        m.addConstr(
+                        total_bins_k * (T + tc)
+                        + quicksum(t * y[t, k] for t in inst.item_types) <= total_bins_k_min_1 * (T + tc)
+                        + quicksum(t * y[t, k-1] for t in inst.item_types)
+                        )
+                """
+                if k > 0:
                     for t in inst.item_types:
                         m.addConstr(
                             y[t, k] <= quicksum(y[t1, k - 1] for t1 in inst.item_types if t1 < t),
-                            name=f"sym_{t}_{k}")
+                            name=f"sym_{t}_{k}")"""
 
             cmax_lb = math.ceil(sum(inst.jobs) / self.machines)
             m.addConstr(Cmax >= cmax_lb, name="cmax_lb_load")
@@ -487,19 +511,25 @@ class ArcFlowReflectSMSP:
 
         # Phase 1 uses scalar y[t] (machine-agnostic) just to enforce demand
         # and last-bin capacity — they will be replaced in phase 2.
-        y_p1 = {t: m.addVar(vtype=GRB.CONTINUOUS, lb=0, ub=d, name=f"y_{t}")
-                for t, d in inst.item_types.items()}
-        m.update()
-
         self._add_flow_conservation(m, xi_s, xi_r)
         z_expr = self._add_source_outflow(m, xi_s, xi_r)
-        self._add_demand_constraints(m, xi_s, xi_r, y_p1, z_expr)
-        m.addConstr(quicksum(t * y_p1[t] for t in inst.item_types) <= T*self.machines,
-                    name="last_cap_p1")
+        if self.machines==1:
+            y    = {t: m.addVar(vtype=GRB.CONTINUOUS, lb=0, ub=d, name=f"y_{t}")
+                    for t, d in inst.item_types.items()}
+            m.addConstr(quicksum(t * y[t] for t in inst.item_types) <= T*self.machines,
+                        name="last_cap_p1")
+            self._add_demand_constraints(m, xi_s, xi_r, y, z_expr)
+        else:
+            self._add_demand_constraints(m, xi_s, xi_r, None, z_expr)
+        m.update()
+
+        
+       
 
         # Phase 1: minimise total z
-        m.setObjective(z_expr + inst.full_bin_count, GRB.MINIMIZE)
+        m.setObjective(z_expr+ inst.full_bin_count, GRB.MINIMIZE)
         m._root_bound = None; m._root_obj = None
+        self._add_z_lower_bound(m, z_expr)
         m.optimize(_phase_callback)
 
         phase1_time = m.Runtime
@@ -508,7 +538,7 @@ class ArcFlowReflectSMSP:
             m._phase1_root_gap = None
             m._phase2_ready    = False
             self._model = m; self._xi_s = xi_s; self._xi_r = xi_r
-            self._y = y_p1; self._u = None; self._ub = None
+            self._u = None; self._ub = None
             return m
 
         z_opt = round(m.ObjVal)
@@ -516,17 +546,14 @@ class ArcFlowReflectSMSP:
                            if m._root_bound is not None and z_opt != 0 else 0.0)
 
         # Fix z at its optimal value
-        z_arc = z_opt - inst.full_bin_count   # the part z_expr must cover
-        m.addConstr(z_expr == z_arc, name="fix_z")
-
-        # Remove phase-1-only constraints and scalar y variables so we can
-        # re-add them in per-machine form for phase 2
+        z_arc = z_opt - inst.full_bin_count
         for t in inst.item_types:
             m.remove(m.getConstrByName(f"dem_{t}"))
-        m.remove(m.getConstrByName("last_cap_p1"))
-        for v in y_p1.values():
-            m.remove(v)
-
+        if self.machines>1:
+            z_arc =z_opt - inst.full_bin_count-self.machines  # the part z_expr must cover
+            m.addConstr(z_expr >= z_arc, name="fix_z")
+        else:
+            m.addConstr(z_expr == z_arc, name="fix_z")
         if self.machines > 1:
             y  = {(t, k): m.addVar(vtype=GRB.INTEGER, lb=0, ub=d, name=f"y_{t}_{k}")
                   for t, d in inst.item_types.items() for k in M}
@@ -541,12 +568,17 @@ class ArcFlowReflectSMSP:
             y    = {t: m.addVar(vtype=GRB.CONTINUOUS, lb=0, ub=d, name=f"y_{t}")
                     for t, d in inst.item_types.items()}
             u = ub = None
-        m.update()
-
+            
         # Re-add demand constraints in per-machine form
         self._add_demand_constraints(m, xi_s, xi_r, y, z_expr,
                                      per_machine=self.machines > 1)
 
+
+        # Remove phase-1-only constraints and scalar y variables so we can
+        # re-add them in per-machine form for phase 2
+
+
+        m.update()
         if self.machines > 1:
             for t in inst.item_types:
                 z_k = quicksum(xi_r[d, e, t1] for (d, e, t1) in graph.R_arcs if t1 == t)
@@ -564,12 +596,7 @@ class ArcFlowReflectSMSP:
                     total_bins_k * (T + tc)
                     + quicksum(t * y[t, k] for t in inst.item_types) <= Cmax,
                     name=f"cmax_{k}")
-                if k > 0:
-                    for t in inst.item_types:
-                        m.addConstr(
-                            y[t, k] <= quicksum(y[t1, k - 1]
-                                                for t1 in inst.item_types if t1 < t),
-                            name=f"sym_{t}_{k}")
+
             cmax_lb = math.ceil(sum(inst.jobs) / self.machines)
             m.addConstr(Cmax >= cmax_lb, name="cmax_lb_load")
             m.setObjective(Cmax, GRB.MINIMIZE)
@@ -578,6 +605,8 @@ class ArcFlowReflectSMSP:
             m.addConstr(quicksum(t * y[t] for t in inst.item_types) <= T, name="last_cap")
             m.setObjective(quicksum(t * y[t] for t in inst.item_types), GRB.MINIMIZE)
             self._Cmax_var = None
+
+
 
         m._root_bound      = None; m._root_obj = None
         m._phase1_time     = phase1_time
@@ -1001,19 +1030,19 @@ def run_single(fpath, csv_path=None, sol_dir=None, t_charge=0,
 # Example invocations (uncomment one block)
 # ─────────────────────────────────────────────
 
-#"""
+   # """
 # --- Folder run, single-phase, 2 machines ---
-folder = "LOW"
+folder = "MOD"
 run_folder(
     folder     = f"Benchmark Instances/Instances/{folder}/",
-    csv_path   = f"results/{folder}_results_2phase_2M_f.csv",
-    sol_dir    = f"results/{folder}_solutions_2_phase_2M_f",
-    t_charge   = 0,
+    csv_path   = f"results/{folder}_results_2M_symmCont_strengthened.csv",
+    sol_dir    = f"results/{folder}_solutions_2M_symmCont_strengthened",
+    t_charge   = 0, 
     time_limit = 3600.0,
     threads    = 1,
     verbose    = True,
     machines   = 2,
-    two_phase  = True,
+    two_phase  = False,
 )
 #"""
 
@@ -1036,13 +1065,13 @@ run_folder(
 """
 # --- Single instance run ---
 setstr = "LOW"
-file   = "L_00000540"
+file   = "L_00000369"
 result = run_single(
     f"Benchmark Instances/Instances/{setstr}/{file}",
     t_charge   = 0,
-    time_limit = 300,
+    time_limit = 100,
     machines   = 2,
-    two_phase  = True,   # ← toggle here
+    two_phase  = False,   # ← toggle here
 )
 print(result.cmax, result.z_nonlast, result.last_load)
 #"""
