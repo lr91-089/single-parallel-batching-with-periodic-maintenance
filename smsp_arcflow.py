@@ -492,7 +492,7 @@ class ArcFlowReflectSMSP:
                 GRB.MINIMIZE)
 
         # Log file for root-gap extraction
-        m.Params.LogFile       = "gurobi_run.log"
+        m.Params.LogFile       = "gurobi_run3.log"
         m.Params.LogToConsole  = 1
         m._root_obj            = None
 
@@ -504,7 +504,7 @@ class ArcFlowReflectSMSP:
     # Two-phase model  (single machine only)
     # ------------------------------------------------------------------
 
-    def _build_model_two_phase(self) -> gp.Model:
+    def  _build_model_two_phase(self) -> gp.Model:
         """
         Build the model and immediately run phase 1 (minimise total z).
         Phase 2 (fix z, minimise Cmax with full machine assignment freedom)
@@ -659,9 +659,9 @@ class ArcFlowReflectSMSP:
         m = self._model; t0 = time.time()
         m.optimize()
         m.Params.LogFile = ""          # release file handle
-        root_gap, _, _ = _get_root_gap_from_log("gurobi_run.log")
+        root_gap, _, _ = _get_root_gap_from_log("gurobi_run3.log")
         try:
-            os.remove("gurobi_run.log")
+            os.remove("gurobi_run3.log")
         except OSError:
             pass
         rt = time.time() - t0; st = m.Status
@@ -966,7 +966,7 @@ def run_folder(folder, csv_path, sol_dir=None, t_charge=0,
     set_name = os.path.basename(os.path.normpath(folder))
 
     for i, fname in enumerate(files, 1):
-        if i-1 not in [369,372,527,546,598,614,658]:
+        #if i-1>317 and i-1 not in [369,372,527,546,598,614,658]:
             fpath = os.path.join(folder, fname)
             print(f"[{i:4d}/{len(files)}] {fname:<32s}", end=" ", flush=True)
             try:
@@ -1057,13 +1057,13 @@ def run_single(fpath, csv_path=None, sol_dir=None, t_charge=0,
 folder = "MOD"
 run_folder(
     folder     = f"Benchmark Instances/Instances/{folder}/",
-    csv_path   = f"results/{folder}_results_2M_symmCont_strengthened_2phase_all2.csv",
-    sol_dir    = f"results/{folder}_solutions_2M_symmCont_strengthened_2phase_all2",
+    csv_path   = f"results/{folder}_results_5M_symmCont_strengthened_2p.csv",
+    sol_dir    = f"results/{folder}_solutions_5M_symmCont_strengthened_2p",
     t_charge   = 0, 
     time_limit = 3600.0,
     threads    = 1,
     verbose    = True,
-    machines   = 2,
+    machines   = 5,
     two_phase  = True,
 )
 #"""
