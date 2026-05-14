@@ -301,12 +301,11 @@ class ArcFlowReflectSMSP:
             two_phase = False"""
         self.two_phase  = two_phase
         self.graph      = ReflectGraph(inst)
-        self.model_name = ("arcflow_reflect")
+        self.model_name = "arcflow_reflect"
         if two_phase:
             self.model_name +="_two_phase"
         self._xi_s      = {}; self._xi_r = {}; self._y = {}
         self._u         = None; self._ub = None
-        self.model_name = "arcflow_reflect"
 
 
     # ------------------------------------------------------------------
@@ -771,6 +770,90 @@ class ArcFlowReflectSMSP:
             phase2_root_gap=phase2_root_gap)
         return res
     
+    def _build_result(self, *, status, cmax, z_val, last_load,
+                      lb, gap, runtime,
+                      root_gap, runtime_phase1, phase1_root_gap, phase2_root_gap
+                      ) -> SolverResult:
+        inst = self.inst
+
+        # Debug: print non-zero variables
+        try:
+            for v in self._model.getVars():
+                if v.X > 1e-5:
+                    print(f"{v.varName} = {v.X:.4g}")
+        except Exception:
+            pass
+
+        # Reconstruct bins
+        xs_val      = {k: v.X for k, v in self._xi_s.items() if v.X > 0.5}
+        xr_val      = {k: v.X for k, v in self._xi_r.items() if v.X > 0.5}
+        bins_ptimes = _reconstruct_bins(xs_val, xr_val, self.graph)
+        for t, count in inst.full_bin_items.items():
+            for _ in range(count):
+                bins_ptimes.append([t])
+
+        # Sort bins by smallest job index (cosmetic)
+        full_pool: Dict[int, List[int]] = defaultdict(list)
+        for idx, p in enumerate(inst.jobs):
+            full_pool[p].append(idx)
+
+        bins_idx = [sorted(full_pool[p].pop(0) for p in pt) for pt in bins_ptimes]
+        if bins_idx:
+            bins_idx, bins_ptimes = zip(
+                *sorted(zip(bins_idx, bins_ptimes), key=lambda x: x[0][0]))
+            bins_idx    = list(bins_idx)
+            bins_ptimes = list(bins_ptimes)
+
+        # Last bin / per-machine reconstruction
+        if self.machines > 1:
+            # Determine how many non-last bins each machine gets from u[t,k] values.
+            # bins_ptimes is already a flat list ordered by arc-flow reconstruction;
+            # we consume from it sequentially per machine.
+            bin_iter = iter(range(len(bins_ptimes)))
+            machine_assignments = {}
+            for k in range(self.machines):
+                n_bins_k = (sum(round(self._u[t, k].X) for t in inst.item_types)
+                            + round(self._u[-1, k].X)
+                            + round(self._ub[k].X))
+                # Take the next n_bins_k bins from the flat list
+                k_bin_indices = [next(bin_iter) for _ in range(n_bins_k)]
+                k_bins_ptimes  = [bins_ptimes[i]  for i in k_bin_indices]
+                k_bins_idx     = [bins_idx[i]      for i in k_bin_indices]
+                last_k_ptimes = []
+                for t in sorted(inst.item_types):
+                    last_k_ptimes.extend([t] * round(self._y[t, k].X))
+                last_k_ptimes.sort()
+                last_k_indices = sorted(full_pool[p].pop(0) for p in last_k_ptimes)
+                machine_assignments[k] = {
+                    "bins_ptimes":  k_bins_ptimes,
+                    "bins_indices": k_bins_idx,
+                    "last_ptimes":  last_k_ptimes,
+                    "last_indices": last_k_indices,
+                }
+            last_ptimes = sorted(p for k in range(self.machines)
+                                 for p in machine_assignments[k]["last_ptimes"])
+            last_idx    = sorted(i for k in range(self.machines)
+                                 for i in machine_assignments[k]["last_indices"])
+        else:
+            machine_assignments = None
+            last_ptimes: List[int] = []
+            for t, var in self._y.items():
+                last_ptimes.extend([t] * round(var.X))
+            last_ptimes.sort()
+            last_idx = sorted(full_pool[p].pop(0) for p in last_ptimes)
+
+        return SolverResult(
+            status=status, cmax=cmax, z_nonlast=int(z_val),
+            last_load=last_load, lb=lb, gap=gap, runtime=runtime,
+            root_gap=root_gap,
+            runtime_phase1=runtime_phase1,
+            phase1_root_gap=phase1_root_gap,
+            phase2_root_gap=phase2_root_gap,
+            instance=inst,
+            bins_indices=bins_idx, last_indices=last_idx,
+            bins_ptimes=bins_ptimes, last_ptimes=last_ptimes,
+            machine_assignments=machine_assignments)
+    
 
 # ─────────────────────────────────────────────
 # Solution file
@@ -1004,7 +1087,7 @@ run_folder(
 """
 # --- Single instance run ---
 setstr = "MOD"
-file   = "L_00000369"
+file   = "L_00000224"
 result = run_single(
     f"Benchmark Instances/Instances/{setstr}/{file}",
     t_charge   = 0,
