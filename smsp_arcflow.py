@@ -286,8 +286,7 @@ class ArcFlowReflectSMSP:
 
     def __init__(self, inst: SMInstance, time_limit: float = 3600.0,
              verbose: bool = False, threads: int = 1,
-             machines: int = 1, two_phase: bool = False,
-             kgraph: bool = False):
+             machines: int = 1, two_phase: bool = False):
         self.inst       = inst
         self.time_limit = time_limit
         self.verbose    = verbose
@@ -302,17 +301,13 @@ class ArcFlowReflectSMSP:
             two_phase = False"""
         self.two_phase  = two_phase
         self.graph      = ReflectGraph(inst)
-        self.model_name = ("arcflow_reflect_kgraph" if kgraph
-                           else "arcflow_reflect")
+        self.model_name = ("arcflow_reflect")
         if two_phase:
             self.model_name +="_two_phase"
         self._xi_s      = {}; self._xi_r = {}; self._y = {}
         self._u         = None; self._ub = None
         self.model_name = "arcflow_reflect"
-        self.kgraph     = kgraph
-        self._xi_s_k    = {}   # (k,d,e,t) → var  (kgraph only)
-        self._xi_r_k    = {}   # (k,d,e,t) → var  (kgraph only)
-        self._z_k       = {}   # k → LinExpr       (kgraph only)
+
 
     # ------------------------------------------------------------------
     # Internal builders
@@ -395,9 +390,7 @@ class ArcFlowReflectSMSP:
     # ------------------------------------------------------------------
 
     def build_model(self) -> gp.Model:
-        if self.kgraph:
-            return self._build_model_kgraph()
-        elif self.two_phase:
+        if self.two_phase:
             return self._build_model_two_phase()
         else:
             return self._build_model_single_phase()
@@ -651,156 +644,6 @@ class ArcFlowReflectSMSP:
         self._u = u; self._ub = ub
         return m
     
-    def _build_model_kgraph(self) -> gp.Model:
-        """
-        K-graph model (single-phase, parallel machines).
-    
-        One copy of the reflect arc-flow graph per machine.  Item-to-machine
-        assignment is encoded directly in which graph's arcs carry the flow,
-        so the u[t,k] linking variables from the shared-graph formulation are
-        not needed.  Only full-bin counts still require an ub[k] variable.
-    
-        Variables per machine k
-        -----------------------
-        xi_s[k,d,e,t]  : S-arc flow    (INTEGER ≥ 0)
-        xi_r[k,d,e,t]  : R-arc flow    (INTEGER ≥ 0)
-        y[t,k]          : last-bin items of type t on machine k  (INTEGER ≥ 0)
-        ub[k]           : full-bin count on machine k            (INTEGER ≥ 0)
-        Cmax            : makespan                               (CONTINUOUS ≥ 0)
-    
-        Key constraints
-        ---------------
-        Flow conservation  : standard reflect flow per machine
-        Source outflow     : out_0[k] == 2 * z_k  (z_k = reflect arcs on k)
-        Demand split       : Σ_k (flow_{t,k} + y[t,k]) == d[t]   ∀ t
-        Last-bin capacity  : Σ_t t·y[t,k] ≤ T                    ∀ k
-        Cmax               : (z_k + ub[k])·(T+tc) + Σ_t t·y[t,k] ≤ Cmax  ∀ k
-        Full-bin split     : Σ_k ub[k] == full_bin_count
-        Symmetry-breaking  : machine loads non-increasing by index
-        """
-        inst  = self.inst;  T = inst.T;  tc = inst.t_charge
-        M     = range(self.machines)
-        graph = self.graph
-        s_set = set(graph.S_arcs)
-    
-        m = gp.Model("SMSP_ArcFlowReflect_Kgraph")
-        m.Params.TimeLimit  = self.time_limit
-        m.Params.Threads    = self.threads
-        m.Params.MIPGap     = 1e-6
-        m.setParam("OutputFlag", 1 if self.verbose else 0)
-    
-        # ── Arc-flow variables, one copy per machine ──────────────────────
-        xi_s_k = {(k, d, e, t): m.addVar(vtype=GRB.INTEGER, lb=0,
-                                           name=f"xs_{k}_{d}_{e}_{t}")
-                   for k in M for (d, e, t) in graph.S_arcs}
-        xi_r_k = {(k, d, e, t): m.addVar(vtype=GRB.INTEGER, lb=0,
-                                           name=f"xr_{k}_{d}_{e}_{t}")
-                   for k in M for (d, e, t) in graph.R_arcs}
-    
-        # ── Last-bin items and full-bin counts per machine ─────────────────
-        y  = {(t, k): m.addVar(vtype=GRB.INTEGER, lb=0, ub=d, name=f"y_{t}_{k}")
-              for t, d in inst.item_types.items() for k in M}
-        ub = {k: m.addVar(vtype=GRB.INTEGER, lb=0,
-                           ub=inst.full_bin_count, name=f"ub_{k}")
-              for k in M}
-        Cmax = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="Cmax")
-        m.update()
-    
-        # ── Per-machine z (reflect-arc total = non-last bin count) ─────────
-        z_k = {k: quicksum(xi_r_k[k, d, e, t] for (d, e, t) in graph.R_arcs)
-                for k in M}
-    
-        # ── Flow conservation (one copy per machine) ───────────────────────
-        for k in M:
-            for node in graph.nodes:
-                if node == 0:
-                    continue
-                in_s  = [xi_s_k[k, d, i, t] for (d, i, t) in graph.S_arcs if i == node]
-                in_r  = [xi_r_k[k, d, i, t] for (d, i, t) in graph.R_arcs if i == node]
-                out_s = [xi_s_k[k, i, f, t] for (i, f, t) in graph.S_arcs if i == node]
-                out_r = [xi_r_k[k, i, f, t] for (i, f, t) in graph.R_arcs if i == node]
-                if in_s or in_r or out_s or out_r:
-                    m.addConstr(
-                        quicksum(in_s) ==
-                        quicksum(in_r) + quicksum(out_s) + quicksum(out_r),
-                        name=f"flow_{k}_{node}")
-    
-        # ── Source outflow per machine: out_0[k] == 2 · z_k ───────────────
-        for k in M:
-            out_0_k = (quicksum(xi_s_k[k, d, e, t] for (d, e, t) in graph.S_arcs if d == 0) +
-                       quicksum(xi_r_k[k, d, e, t] for (d, e, t) in graph.R_arcs if d == 0))
-            m.addConstr(out_0_k == 2 * z_k[k], name=f"source_outflow_{k}")
-    
-        # ── Demand: Σ_k (flow_{t,k} + y[t,k]) == d[t] ────────────────────
-        for t, arcs in graph.Aj.items():
-            total_flow_t = quicksum(
-                xi_s_k[k, d, e, tt] if (d, e, tt) in s_set else xi_r_k[k, d, e, tt]
-                for k in M for (d, e, tt) in arcs
-            )
-            m.addConstr(
-                total_flow_t + quicksum(y[t, k] for k in M) == inst.item_types[t],
-                name=f"dem_{t}")
-    
-        # ── Full-bin split ─────────────────────────────────────────────────
-        m.addConstr(quicksum(ub[k] for k in M) == inst.full_bin_count,
-                    name="ub_split")
-    
-        # ── Per-machine capacity and Cmax ──────────────────────────────────
-        for k in M:
-            last_load_k  = quicksum(t * y[t, k] for t in inst.item_types)
-            total_bins_k = z_k[k] + ub[k]
-            m.addConstr(last_load_k <= T,
-                        name=f"last_cap_{k}")
-            m.addConstr(total_bins_k * (T + tc) + last_load_k <= Cmax,
-                        name=f"cmax_{k}")
-            
-        # ── Symmetry-breaking: fix the first graph-item to machine 0 ──────────
-        # Scan jobs in original order for the first one whose type is in the
-        # arc-flow graph (p < T).  Fall back to full bins if no such job exists.
-        first_graph_p = next((p for p in inst.jobs if p in inst.item_types), None)
-        
-        if first_graph_p is not None:
-            flow_first_m0 = quicksum(
-                xi_s_k[0, d, e, t] if (d, e, t) in s_set else xi_r_k[0, d, e, t]
-                for (d, e, t) in graph.Aj[first_graph_p]
-            )
-            m.addConstr(flow_first_m0 + y[first_graph_p, 0] >= 1,
-                        name="sym_fix_job0")
-        elif inst.full_bin_count > 0:          # all jobs are full-bin items (p == T)
-            m.addConstr(ub[0] >= 1, name="sym_fix_job0")
-            
-        
-    
-        # ── Symmetry-breaking: machine completion times non-increasing ─────
-        if len(M) > 2:
-            for k in M[2:]:
-                    load_k   = ((z_k[k]   + ub[k])   * (T + tc)
-                                + quicksum(t * y[t, k]   for t in inst.item_types))
-                    load_km1 = ((z_k[k-1] + ub[k-1]) * (T + tc)
-                                + quicksum(t * y[t, k-1] for t in inst.item_types))
-                    m.addConstr(load_k <= load_km1, name=f"sym_{k}")
-    
-        # ── Global z lower bound (total non-last bins across all machines) ─
-        self._add_z_lower_bound(m, quicksum(z_k[k] for k in M))
-    
-        # ── Cmax lower bound (load-based) ──────────────────────────────────
-        m.addConstr(Cmax >= math.ceil(sum(inst.jobs) / self.machines),
-                    name="cmax_lb_load")
-    
-        m.setObjective(Cmax, GRB.MINIMIZE)
-        m.Params.LogFile      = "gurobi_run.log"
-        m.Params.LogToConsole = 1
-        m._root_obj           = None
-    
-        self._model    = m
-        self._xi_s_k   = xi_s_k
-        self._xi_r_k   = xi_r_k
-        self._y        = y
-        self._u        = None   # not used
-        self._ub       = ub
-        self._z_k      = z_k
-        return m
-
     # ------------------------------------------------------------------
     # solve()
     # ------------------------------------------------------------------
@@ -808,9 +651,7 @@ class ArcFlowReflectSMSP:
     def solve(self) -> SolverResult:
         if self._model is None:
             self.build_model()
-        if self.kgraph:
-            return self._solve_kgraph()
-        elif self.two_phase:
+        if self.two_phase:
             return self._solve_two_phase()
         else:
             return self._solve_single_phase()
@@ -930,127 +771,6 @@ class ArcFlowReflectSMSP:
             phase2_root_gap=phase2_root_gap)
         return res
     
-    def _solve_kgraph(self) -> SolverResult:
-        m = self._model;  t0 = time.time()
-        m.optimize()
-        m.Params.LogFile = ""
-        root_gap, _, _ = _get_root_gap_from_log("gurobi_run.log")
-        try:
-            os.remove("gurobi_run.log")
-        except OSError:
-            pass
-        rt = time.time() - t0;  st = m.Status
-    
-        if m.SolCount == 0:
-            if st == GRB.INFEASIBLE:
-                m.computeIIS(); m.write("infeasible_model.ilp")
-            return SolverResult(
-                status="infeasible" if st == GRB.INFEASIBLE else "timeout",
-                cmax=None, z_nonlast=None, last_load=None,
-                lb=None, gap=None, runtime=rt, root_gap=None,
-                runtime_phase1=None, phase1_root_gap=None, phase2_root_gap=None,
-                instance=self.inst)
-    
-        M = range(self.machines)
-        # Total non-last bins = Σ_k (reflect arcs on k) + full bins
-        z_val     = (sum(round(self._z_k[k].getValue()) for k in M)
-                     + self.inst.full_bin_count)
-        last_load = sum(t * self._y[t, k].X
-                        for t in self.inst.item_types for k in M)
-        status    = "optimal" if st == GRB.OPTIMAL else "feasible"
-    
-        return self._build_result_kgraph(
-            status=status, cmax=m.ObjVal, z_val=z_val, last_load=last_load,
-            lb=m.ObjBound, gap=m.MIPGap, runtime=rt, root_gap=root_gap)
-    
-        # ------------------------------------------------------------------
-        # Shared result builder
-        # ------------------------------------------------------------------
-    
-        def _build_result(self, *, status, cmax, z_val, last_load,
-                          lb, gap, runtime,
-                          root_gap, runtime_phase1, phase1_root_gap, phase2_root_gap
-                          ) -> SolverResult:
-            inst = self.inst
-    
-            # Debug: print non-zero variables
-            try:
-                for v in self._model.getVars():
-                    if v.X > 1e-5:
-                        print(f"{v.varName} = {v.X:.4g}")
-            except Exception:
-                pass
-    
-            # Reconstruct bins
-            xs_val      = {k: v.X for k, v in self._xi_s.items() if v.X > 0.5}
-            xr_val      = {k: v.X for k, v in self._xi_r.items() if v.X > 0.5}
-            bins_ptimes = _reconstruct_bins(xs_val, xr_val, self.graph)
-            for t, count in inst.full_bin_items.items():
-                for _ in range(count):
-                    bins_ptimes.append([t])
-    
-            # Sort bins by smallest job index (cosmetic)
-            full_pool: Dict[int, List[int]] = defaultdict(list)
-            for idx, p in enumerate(inst.jobs):
-                full_pool[p].append(idx)
-    
-            bins_idx = [sorted(full_pool[p].pop(0) for p in pt) for pt in bins_ptimes]
-            if bins_idx:
-                bins_idx, bins_ptimes = zip(
-                    *sorted(zip(bins_idx, bins_ptimes), key=lambda x: x[0][0]))
-                bins_idx    = list(bins_idx)
-                bins_ptimes = list(bins_ptimes)
-    
-            # Last bin / per-machine reconstruction
-            if self.machines > 1:
-                # Determine how many non-last bins each machine gets from u[t,k] values.
-                # bins_ptimes is already a flat list ordered by arc-flow reconstruction;
-                # we consume from it sequentially per machine.
-                bin_iter = iter(range(len(bins_ptimes)))
-                machine_assignments = {}
-                for k in range(self.machines):
-                    n_bins_k = (sum(round(self._u[t, k].X) for t in inst.item_types)
-                                + round(self._u[-1, k].X)
-                                + round(self._ub[k].X))
-                    # Take the next n_bins_k bins from the flat list
-                    k_bin_indices = [next(bin_iter) for _ in range(n_bins_k)]
-                    k_bins_ptimes  = [bins_ptimes[i]  for i in k_bin_indices]
-                    k_bins_idx     = [bins_idx[i]      for i in k_bin_indices]
-                    last_k_ptimes = []
-                    for t in sorted(inst.item_types):
-                        last_k_ptimes.extend([t] * round(self._y[t, k].X))
-                    last_k_ptimes.sort()
-                    last_k_indices = sorted(full_pool[p].pop(0) for p in last_k_ptimes)
-                    machine_assignments[k] = {
-                        "bins_ptimes":  k_bins_ptimes,
-                        "bins_indices": k_bins_idx,
-                        "last_ptimes":  last_k_ptimes,
-                        "last_indices": last_k_indices,
-                    }
-                last_ptimes = sorted(p for k in range(self.machines)
-                                     for p in machine_assignments[k]["last_ptimes"])
-                last_idx    = sorted(i for k in range(self.machines)
-                                     for i in machine_assignments[k]["last_indices"])
-            else:
-                machine_assignments = None
-                last_ptimes: List[int] = []
-                for t, var in self._y.items():
-                    last_ptimes.extend([t] * round(var.X))
-                last_ptimes.sort()
-                last_idx = sorted(full_pool[p].pop(0) for p in last_ptimes)
-    
-            return SolverResult(
-                status=status, cmax=cmax, z_nonlast=int(z_val),
-                last_load=last_load, lb=lb, gap=gap, runtime=runtime,
-                root_gap=root_gap,
-                runtime_phase1=runtime_phase1,
-                phase1_root_gap=phase1_root_gap,
-                phase2_root_gap=phase2_root_gap,
-                instance=inst,
-                bins_indices=bins_idx, last_indices=last_idx,
-                bins_ptimes=bins_ptimes, last_ptimes=last_ptimes,
-                machine_assignments=machine_assignments)
-
 
 # ─────────────────────────────────────────────
 # Solution file
@@ -1163,7 +883,7 @@ def run_folder(folder, csv_path, sol_dir=None, t_charge=0,
     set_name = os.path.basename(os.path.normpath(folder))
 
     for i, fname in enumerate(files, 1):
-        if i-1 in [369,372,527,546,598,614,658]:
+        if i-1 not in [369,372,527,546,598,614,658]:
             fpath = os.path.join(folder, fname)
             print(f"[{i:4d}/{len(files)}] {fname:<32s}", end=" ", flush=True)
             try:
@@ -1200,7 +920,7 @@ def run_folder(folder, csv_path, sol_dir=None, t_charge=0,
 
 def run_single(fpath, csv_path=None, sol_dir=None, t_charge=0,
                time_limit=3600.0, verbose=True, threads=1,
-               machines=1, two_phase=False, kgraph=False):
+               machines=1, two_phase=False):
     fname = os.path.basename(fpath)
     inst  = SMInstance.from_file(fpath, t_charge=t_charge)
     print(f"Instance : {fname}\n  {inst.summary()}")
@@ -1209,7 +929,7 @@ def run_single(fpath, csv_path=None, sol_dir=None, t_charge=0,
 
     solver = ArcFlowReflectSMSP(inst, time_limit=time_limit,
                                   verbose=verbose, threads=threads,
-                                  machines=machines, two_phase=two_phase, kgraph=kgraph)
+                                  machines=machines, two_phase=two_phase)
     solver.build_model()
     res = solver.solve()
 
@@ -1249,13 +969,13 @@ def run_single(fpath, csv_path=None, sol_dir=None, t_charge=0,
 # Example invocations (uncomment one block)
 # ─────────────────────────────────────────────
 
-"""
+#"""
 # --- Folder run, single-phase, 2 machines ---
 folder = "MOD"
 run_folder(
     folder     = f"Benchmark Instances/Instances/{folder}/",
-    csv_path   = f"results/{folder}_results_2M_symmCont_strengthened_2phase.csv",
-    sol_dir    = f"results/{folder}_solutions_2M_symmCont_strengthened_2phase",
+    csv_path   = f"results/{folder}_results_2M_symmCont_strengthened_2phase_all2.csv",
+    sol_dir    = f"results/{folder}_solutions_2M_symmCont_strengthened_2phase_all2",
     t_charge   = 0, 
     time_limit = 3600.0,
     threads    = 1,
@@ -1281,7 +1001,7 @@ run_folder(
 )
 """
 
-#"""
+"""
 # --- Single instance run ---
 setstr = "MOD"
 file   = "L_00000369"
@@ -1291,7 +1011,6 @@ result = run_single(
     time_limit = 3600,
     machines   = 2,
     two_phase  = False,
-    kgraph     = True,
 )
 print(result.cmax, result.z_nonlast, result.last_load)
 #"""
