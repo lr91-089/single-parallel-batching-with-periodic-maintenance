@@ -382,6 +382,7 @@ class ArcFlowReflectSMSP:
         overflow = max(0, sum(small) - slack)           # small load that can't fit there
         z_lb_mt = len(large) + math.ceil(overflow / T) - self.machines
         z_lb = max(0,z_lb_load,z_lb_mt)
+        print(z_lb)
         m.addConstr(z_expr >= z_lb, name="z_lb")
 
     # ------------------------------------------------------------------
@@ -454,26 +455,27 @@ class ArcFlowReflectSMSP:
                     total_bins_k * (T + tc)
                     + quicksum(t * y[t, k] for t in inst.item_types) <= Cmax,
                     name=f"cmax_{k}")
-                # Symmetry-breaking
+            # Symmetry-breaking
                 
-                if k > 1:
-                    for k in M[1:]:
-                        total_bins_k = (quicksum(u[t, k] for t in inst.item_types)
-                                        + u[-1, k] + ub[k]+ quicksum(t * y[t, k] for t in inst.item_types))
-                        total_bins_k_min_1 = (quicksum(u[t,k-1] for t in inst.item_types)
-                                        + u[-1, k-1] + ub[k-1]+ quicksum(t * y[t, k-1] for t in inst.item_types))
-                        m.addConstr(
-                        total_bins_k  <= total_bins_k_min_1) 
-                        """
-                        total_bins_k = (quicksum(u[t, k] for t in inst.item_types)
-                                        + u[-1, k] + ub[k])
-                        total_bins_k_min_1 = (quicksum(u[t,k-1] for t in inst.item_types)
-                                        + u[-1, k-1] + ub[k-1])
-                        m.addConstr(
-                        total_bins_k * (T + tc)
-                        + quicksum(t * y[t, k] for t in inst.item_types) <= total_bins_k_min_1 * (T + tc)
-                        + quicksum(t * y[t, k-1] for t in inst.item_types)
-                        )"""
+            #if k > 1:
+                """
+                for k in M[1:]:
+                    total_bins_k = (quicksum(u[t, k] for t in inst.item_types)
+                                    + u[-1, k] + ub[k]+ quicksum(t * y[t, k] for t in inst.item_types))
+                    total_bins_k_min_1 = (quicksum(u[t,k-1] for t in inst.item_types)
+                                    + u[-1, k-1] + ub[k-1]+ quicksum(t * y[t, k-1] for t in inst.item_types))
+                    m.addConstr(
+                    total_bins_k  <= total_bins_k_min_1) """
+                """
+                    total_bins_k = (quicksum(u[t, k] for t in inst.item_types)
+                                    + u[-1, k] + ub[k])
+                    total_bins_k_min_1 = (quicksum(u[t,k-1] for t in inst.item_types)
+                                    + u[-1, k-1] + ub[k-1])
+                    m.addConstr(
+                    total_bins_k * (T + tc)
+                    + quicksum(t * y[t, k] for t in inst.item_types) <= total_bins_k_min_1 * (T + tc)
+                    + quicksum(t * y[t, k-1] for t in inst.item_types)
+                    )"""
                 """
                 if k > 0:
                     for k in M[1:]:
@@ -490,7 +492,9 @@ class ArcFlowReflectSMSP:
                 (z_expr + inst.full_bin_count) * (T + tc)
                 + quicksum(t * y[t] for t in inst.item_types),
                 GRB.MINIMIZE)
-
+            
+                
+        
         # Log file for root-gap extraction
         m.Params.LogFile       = "gurobi_run3.log"
         m.Params.LogToConsole  = 1
@@ -966,7 +970,20 @@ def run_folder(folder, csv_path, sol_dir=None, t_charge=0,
     set_name = os.path.basename(os.path.normpath(folder))
 
     for i, fname in enumerate(files, 1):
-        #if i-1>317 and i-1 not in [369,372,527,546,598,614,658]:
+        if i-1>0 and i-1 in [132,
+                163,
+                192,
+                151,
+                246,
+                200,
+                224,
+                182,
+                53,
+                245,
+                216,
+                73,
+                172,
+                61]:
             fpath = os.path.join(folder, fname)
             print(f"[{i:4d}/{len(files)}] {fname:<32s}", end=" ", flush=True)
             try:
@@ -1054,17 +1071,18 @@ def run_single(fpath, csv_path=None, sol_dir=None, t_charge=0,
 
 #"""
 # --- Folder run, single-phase, 2 machines ---
+"""
 folder = "MOD"
 run_folder(
     folder     = f"Benchmark Instances/Instances/{folder}/",
-    csv_path   = f"results/{folder}_results_5M_symmCont_strengthened_2p.csv",
-    sol_dir    = f"results/{folder}_solutions_5M_symmCont_strengthened_2p",
+    csv_path   = f"results/{folder}_results_5M_symmCont_strengthened_part3.csv",
+    sol_dir    = f"results/{folder}_solutions_5M_symmCont_strengthened3",
     t_charge   = 0, 
-    time_limit = 3600.0,
+    time_limit = 720.0,
     threads    = 1,
     verbose    = True,
     machines   = 5,
-    two_phase  = True,
+    two_phase  = False,
 )
 #"""
 
@@ -1087,12 +1105,12 @@ run_folder(
 """
 # --- Single instance run ---
 setstr = "MOD"
-file   = "L_00000224"
+file   = "L_00000262"
 result = run_single(
     f"Benchmark Instances/Instances/{setstr}/{file}",
     t_charge   = 0,
-    time_limit = 3600,
-    machines   = 2,
+    time_limit = 20,
+    machines   = 5,
     two_phase  = False,
 )
 print(result.cmax, result.z_nonlast, result.last_load)
