@@ -73,68 +73,106 @@ class BPPMInstance:
 
 class BatchGraph:
     """
-    Extension of Mrad & Souayah (2018) to multiple batch slots,
-    with arcs indexed by item TYPE instead of individual jobs.
-    A'  (item arcs):  (i, j, p)  where j-i=p, both in [b*T, (b+1)*T]
-    A'' (trans arcs): (i, (b+1)*T) — flow conservation only, no Cmax contrib
-    Bug fix vs Mrad original: BFS inner loop per type p so that chains like
-    0→3→6 with p=3 are correctly generated (node 3, created by the first
-    p=3 arc, can host a second p=3 arc within the same pass).
-    Note on batch-crossing arcs: merging the transition hop and the first
-    item arc into a single cross arc (i → (b+1)T+p) adds one arc per
-    (node, type) pair per batch boundary, multiplying trans_arcs by |types|.
-    In practice this exceeds the variable savings from the symmetry filter
-    p ≤ p_creating[i], so we keep the simpler two-hop structure.
+    Compressed, symmetry-reduced arc-flow graph for multi-batch scheduling.
+
+    Based on Brandão & Pedroso (2015) §5.1–5.2:
+      §5.1 Symmetry breaking: item types processed in fixed decreasing order
+           (levels). Only valid item orderings within a bin are generated.
+      §5.2 Compression: levels used only during construction, then dropped
+           from stored arcs — identical sub-patterns at different levels
+           collapse into one arc in the MIP.
+
+    Stored arc types:
+      item_arcs:  (i, j, p)  — place item type p, advancing position i→j
+      trans_arcs: (i, j)     — hop from end-of-batch position to next batch start
+    Loss arcs are implicit in level propagation; no separate storage needed.
+    MIP variables are indexed by plain integer positions (no level tuples),
+    which directly fixes the TypeError z >= j * y[i,j,p] in solve().
     """
+
     def __init__(self, inst: BPPMInstance, z_max: int):
-        self.inst  = inst
-        self.T     = inst.T
-        self.z_max = z_max
-        self.UB    = z_max * inst.T
-        self.item_arcs:  List[Tuple[int, int, int]] = []   # A'  (i, j, p)
-        self.cross_arcs: List[Tuple[int, int, int]] = []   # empty — kept for API compat
-        self.trans_arcs: List[Tuple[int, int]]       = []   # A'' (i, (b+1)*T)
+        self.inst         = inst
+        self.T            = inst.T
+        self.z_max        = z_max
+        self.UB           = z_max * inst.T
+        self.types_sorted = sorted(inst.item_types.keys(), reverse=True)
+        self.m            = len(self.types_sorted)
+
+        self.item_arcs:  List[Tuple[int, int, int]] = []
+        self.trans_arcs: List[Tuple[int, int]]       = []
         self.nodes:      Set[int]                    = set()
-        self.At:         Dict[int, List]             = defaultdict(list)
+        self._arc_set:   Set[Tuple[int, int, int]]   = set()  # deduplication guard
+
         self._build()
+
     def _build(self):
-        inst = self.inst; T = self.T; z_max = self.z_max
-        types_sorted = sorted(inst.item_types.keys(), reverse=True)
-        seen:      Set[Tuple] = set()
-        reachable: Set[int]   = set()
-        # ── Within-batch item arcs ────────────────────────────────────────
-        for b in range(z_max):
-            start = b * T
-            reachable.add(start)
-            batch_heads: Set[int] = {start}
-            for p in types_sorted:
-                # BFS so that a node created by arc (i→j, p) can immediately
-                # host another arc of the same type p within the same pass.
-                frontier: Set[int] = set(batch_heads)
+        T = self.T
+        m = self.m
+
+        for b in range(self.z_max):
+            batch_start = b * T
+            batch_end   = batch_start + T
+
+            # level_nodes[ℓ] = absolute positions reachable at level ℓ
+            # Levels enforce item-type ordering (§5.1); dropped from arc keys (§5.2)
+            level_nodes: Dict[int, Set[int]] = defaultdict(set)
+            level_nodes[0].add(batch_start)
+            self.nodes.add(batch_start)
+
+            for ℓ in range(m):
+                p = self.types_sorted[ℓ]
+
+                # BFS within level ℓ.
+                # Seed from ALL current positions at this level so that arcs
+                # between already-known positions (e.g. 0→p when both 0 and p
+                # were inherited via loss from ℓ-1) are not missed.
+                frontier = list(level_nodes[ℓ])
                 while frontier:
-                    next_frontier: Set[int] = set()
-                    for i in sorted(frontier):
-                        j = i + p
-                        if j <= start + T:
-                            arc = (i, j, p)
-                            if arc not in seen:
-                                seen.add(arc)
+                    next_frontier = []
+                    for pos in frontier:
+                        j = pos + p
+                        if j <= batch_end:
+                            arc = (pos, j, p)
+                            if arc not in self._arc_set:
+                                self._arc_set.add(arc)
                                 self.item_arcs.append(arc)
-                                self.At[p].append(arc)
-                                reachable.add(j)
-                                if j not in batch_heads:
-                                    batch_heads.add(j)
-                                    next_frontier.add(j)
+                            if j not in level_nodes[ℓ]:
+                                level_nodes[ℓ].add(j)
+                                self.nodes.add(j)
+                                next_frontier.append(j)
                     frontier = next_frontier
 
-        # ── Transition arcs A'': each reachable node → next batch-start ──
-        # One arc per reachable node (not multiplied by |types|).
-        for i in sorted(reachable):
-            b = i // T
-            j = (b + 1) * T
-            if j <= self.UB:
-                self.trans_arcs.append((i, j))
-        self.nodes = reachable | {b * T for b in range(z_max + 1)}
+                # Implicit loss arc: propagate all level-ℓ positions to ℓ+1.
+                # No arc stored — compression merges the flow through positions.
+                if ℓ < m - 1:
+                    for pos in level_nodes[ℓ]:
+                        if pos not in level_nodes[ℓ + 1]:
+                            level_nodes[ℓ + 1].add(pos)
+                            self.nodes.add(pos)
+
+            # Transition arcs: every position reachable at the final level
+            # gets one hop to the next batch's start node.
+            next_start = (b + 1) * T
+            if next_start <= self.UB:
+                for pos in level_nodes[m - 1]:
+                    self.trans_arcs.append((pos, next_start))
+                self.nodes.add(next_start)
+
+    @property
+    def At(self) -> Dict[int, List]:
+        """Group item arcs by type p — for demand constraints in the MIP."""
+        result: Dict[int, List] = defaultdict(list)
+        for arc in self.item_arcs:
+            result[arc[2]].append(arc)
+        return result
+
+    def summary(self):
+        n_item  = len(self.item_arcs)
+        n_trans = len(self.trans_arcs)
+        print(f"Nodes:      {len(self.nodes)}")
+        print(f"Item arcs:  {n_item}")
+        print(f"Trans arcs: {n_trans}")
+        print(f"Total arcs: {n_item + n_trans}")
         
 # ─────────────────────────────────────────────
 # Solver
@@ -160,7 +198,7 @@ def solve(inst: BPPMInstance, z_max: int,
 
     graph = BatchGraph(inst, z_max=z_max)
     T, m, UB = inst.T, inst.m, graph.UB
-    #graph.summary()
+    graph.summary()
 
     model = gp.Model("PBPM_BatchGraph_Int")
     model.Params.TimeLimit  = time_limit
