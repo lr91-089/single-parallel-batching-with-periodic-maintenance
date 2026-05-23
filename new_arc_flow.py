@@ -24,6 +24,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Optional
 
+
 import gurobipy as gp
 from gurobipy import GRB, quicksum
 
@@ -68,52 +69,44 @@ class BPPMInstance:
 # Graph
 # ─────────────────────────────────────────────
 
+
+
 class BatchGraph:
     """
     Extension of Mrad & Souayah (2018) to multiple batch slots,
     with arcs indexed by item TYPE instead of individual jobs.
-
     A'  (item arcs):  (i, j, p)  where j-i=p, both in [b*T, (b+1)*T]
     A'' (trans arcs): (i, (b+1)*T) — flow conservation only, no Cmax contrib
-
     Bug fix vs Mrad original: BFS inner loop per type p so that chains like
     0→3→6 with p=3 are correctly generated (node 3, created by the first
     p=3 arc, can host a second p=3 arc within the same pass).
-
     Note on batch-crossing arcs: merging the transition hop and the first
     item arc into a single cross arc (i → (b+1)T+p) adds one arc per
     (node, type) pair per batch boundary, multiplying trans_arcs by |types|.
     In practice this exceeds the variable savings from the symmetry filter
     p ≤ p_creating[i], so we keep the simpler two-hop structure.
     """
-
     def __init__(self, inst: BPPMInstance, z_max: int):
         self.inst  = inst
         self.T     = inst.T
         self.z_max = z_max
         self.UB    = z_max * inst.T
-
         self.item_arcs:  List[Tuple[int, int, int]] = []   # A'  (i, j, p)
         self.cross_arcs: List[Tuple[int, int, int]] = []   # empty — kept for API compat
         self.trans_arcs: List[Tuple[int, int]]       = []   # A'' (i, (b+1)*T)
         self.nodes:      Set[int]                    = set()
         self.At:         Dict[int, List]             = defaultdict(list)
-
         self._build()
-
     def _build(self):
         inst = self.inst; T = self.T; z_max = self.z_max
-
         types_sorted = sorted(inst.item_types.keys(), reverse=True)
         seen:      Set[Tuple] = set()
         reachable: Set[int]   = set()
-
         # ── Within-batch item arcs ────────────────────────────────────────
         for b in range(z_max):
             start = b * T
             reachable.add(start)
             batch_heads: Set[int] = {start}
-
             for p in types_sorted:
                 # BFS so that a node created by arc (i→j, p) can immediately
                 # host another arc of the same type p within the same pass.
@@ -133,7 +126,6 @@ class BatchGraph:
                                     batch_heads.add(j)
                                     next_frontier.add(j)
                     frontier = next_frontier
-                    
 
         # ── Transition arcs A'': each reachable node → next batch-start ──
         # One arc per reachable node (not multiplied by |types|).
@@ -142,19 +134,8 @@ class BatchGraph:
             j = (b + 1) * T
             if j <= self.UB:
                 self.trans_arcs.append((i, j))
-
         self.nodes = reachable | {b * T for b in range(z_max + 1)}
-
-    def summary(self) -> str:
-        n_binary_equiv = sum(self.inst.item_types[p]
-                             for (i,j,p) in self.item_arcs)
-        return (f"UB={self.UB}, T={self.T}, z_max={self.z_max}, "
-                f"nodes={len(self.nodes)}, "
-                f"item_arcs={len(self.item_arcs)}, "
-                f"trans_arcs={len(self.trans_arcs)} "
-                f"(binary-equiv={n_binary_equiv})")
-
-
+        
 # ─────────────────────────────────────────────
 # Solver
 # ─────────────────────────────────────────────
@@ -179,7 +160,7 @@ def solve(inst: BPPMInstance, z_max: int,
 
     graph = BatchGraph(inst, z_max=z_max)
     T, m, UB = inst.T, inst.m, graph.UB
-    print(f"Graph: {graph.summary()}")
+    #graph.summary()
 
     model = gp.Model("PBPM_BatchGraph_Int")
     model.Params.TimeLimit  = time_limit
@@ -382,12 +363,6 @@ def run_folder(folder: str, csv_path: str, sol_dir: str = None,
     print("-" * 72)
 
     for idx, fname in enumerate(files, 1):
-        if idx-1 in [262,
-309,
-346,
-370,
-499,
-506]:
             fpath = os.path.join(folder, fname)
             print(f"[{idx:4d}/{len(files)}] {fname:<32s}", end=" ", flush=True)
     
@@ -446,8 +421,8 @@ def run_folder(folder: str, csv_path: str, sol_dir: str = None,
                     os.path.join(sol_dir, fname + ".sol"),
                     inst, res.cmax, res.xi, res.xt, res.yi, res.graph)
     
-        print("-" * 72)
-        print(f"Done. Results -> {csv_path}")
+            print("-" * 72)
+            print(f"Done. Results -> {csv_path}")
 
 
 # ─────────────────────────────────────────────
@@ -618,16 +593,15 @@ def run_single(fpath: str,
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-
-    # --- single instance ---
     #"""
-    setstr = "MOD"
-    file   = "L_00000262"
+    # --- single instance ---
+    setstr = "Set1"
+    file   = "L_00000702"
     result = run_single(
-        f"Benchmark Instances/Instances/{setstr}/{file}",
+        f"Benchmark Instances/New Instances/{setstr}/{file}",
         t_charge   = 0,
         time_limit = 100,
-        machines   = 5,
+        machines   = 10,
     )
     print(f"Final Cmax: {result.cmax}")
     #"""
@@ -636,11 +610,11 @@ if __name__ == "__main__":
     folder = "MOD"
     run_folder(
         folder     = f"Benchmark Instances/Instances/{folder}/",
-        csv_path   = f"results/{folder}_new_arcflow_5m_fixed2.csv",
-        sol_dir    = f"results/{folder}_new_arcflow_5m_fixed2_sol/",
+        csv_path   = f"results/{folder}_new_arcflow_2m.csv",
+        sol_dir    = f"results/{folder}_new_arcflow_2m_sol/",
         t_charge   = 0,
         time_limit = 720.0,
         threads    = 1,
-        verbose    = False,
-        machines   = 5,
+        verbose    = True,
+        machines   = 2,
     )#"""
