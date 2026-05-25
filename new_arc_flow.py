@@ -69,8 +69,6 @@ class BPPMInstance:
 # Graph
 # ─────────────────────────────────────────────
 
-
-
 class BatchGraph:
     """
     Compressed, symmetry-reduced arc-flow graph for multi-batch scheduling.
@@ -84,10 +82,21 @@ class BatchGraph:
 
     Stored arc types:
       item_arcs:  (i, j, p)  — place item type p, advancing position i→j
-      trans_arcs: (i, j)     — hop from end-of-batch position to next batch start
-    Loss arcs are implicit in level propagation; no separate storage needed.
-    MIP variables are indexed by plain integer positions (no level tuples),
-    which directly fixes the TypeError z >= j * y[i,j,p] in solve().
+      loss_arcs:  (i, j)     — connect consecutive reachable nodes, carrying
+                               slack flow within a batch and crossing batch
+                               boundaries. Replaces the former trans_arcs:
+                               no separate inter-batch hop variable is needed
+                               because the sorted reachable node list already
+                               includes every batch-start node, so a single
+                               loss arc from the last reachable node before
+                               (b+1)*T to (b+1)*T closes the batch in one hop,
+                               exactly as a transition arc did — but uniformly.
+
+    Loss arcs between consecutive reachable nodes subsume both roles that
+    transition arcs previously played:
+      (a) carrying slack flow to the end of the current batch, and
+      (b) hopping to the start of the next batch.
+    This removes the need for a separate trans_arcs list and xt variables.
     """
 
     def __init__(self, inst: BPPMInstance, z_max: int):
@@ -98,10 +107,10 @@ class BatchGraph:
         self.types_sorted = sorted(inst.item_types.keys(), reverse=True)
         self.m            = len(self.types_sorted)
 
-        self.item_arcs:  List[Tuple[int, int, int]] = []
-        self.trans_arcs: List[Tuple[int, int]]       = []
-        self.nodes:      Set[int]                    = set()
-        self._arc_set:   Set[Tuple[int, int, int]]   = set()  # deduplication guard
+        self.item_arcs: List[Tuple[int, int, int]] = []
+        self.loss_arcs: List[Tuple[int, int]]       = []
+        self.nodes:     Set[int]                    = set()
+        self._arc_set:  Set[Tuple[int, int, int]]   = set()  # deduplication guard
 
         self._build()
 
@@ -150,13 +159,19 @@ class BatchGraph:
                             level_nodes[ℓ + 1].add(pos)
                             self.nodes.add(pos)
 
-            # Transition arcs: every position reachable at the final level
-            # gets one hop to the next batch's start node.
-            next_start = (b + 1) * T
-            if next_start <= self.UB:
-                for pos in level_nodes[m - 1]:
-                    self.trans_arcs.append((pos, next_start))
-                self.nodes.add(next_start)
+            # Ensure batch_end is always a node (needed as loss-arc target and
+            # as the seed for the next batch's level_nodes[0]).
+            self.nodes.add(batch_end)
+
+        # ── Loss arcs: connect every pair of consecutive reachable nodes ──
+        # Sorting the full node set gives a chain u0 < u1 < u2 < … < UB.
+        # Each consecutive pair (u_k, u_{k+1}) gets one loss arc regardless
+        # of whether the pair straddles a batch boundary — this naturally
+        # closes each batch and hops to the next one without a separate
+        # trans_arcs mechanism.
+        sorted_nodes = sorted(self.nodes)
+        for u, v in zip(sorted_nodes, sorted_nodes[1:]):
+            self.loss_arcs.append((u, v))
 
     @property
     def At(self) -> Dict[int, List]:
@@ -167,13 +182,14 @@ class BatchGraph:
         return result
 
     def summary(self):
-        n_item  = len(self.item_arcs)
-        n_trans = len(self.trans_arcs)
+        n_item = len(self.item_arcs)
+        n_loss = len(self.loss_arcs)
         print(f"Nodes:      {len(self.nodes)}")
         print(f"Item arcs:  {n_item}")
-        print(f"Trans arcs: {n_trans}")
-        print(f"Total arcs: {n_item + n_trans}")
-        
+        print(f"Loss arcs:  {n_loss}")
+        print(f"Total arcs: {n_item + n_loss}")
+
+
 # ─────────────────────────────────────────────
 # Solver
 # ─────────────────────────────────────────────
@@ -188,7 +204,7 @@ class SolveResult:
     graph:   object   # BatchGraph, kept for solution writing
     xi:      dict
     yi:      dict
-    xt:      dict
+    xl:      dict     # loss arc flows (replaces xt)
 
 
 def solve(inst: BPPMInstance, z_max: int,
@@ -213,8 +229,9 @@ def solve(inst: BPPMInstance, z_max: int,
           for (i,j,p) in graph.item_arcs}
     yi = {(i,j,p): model.addVar(vtype=GRB.BINARY, name=f"y_{i}_{j}_{p}")
           for (i,j,p) in graph.item_arcs}
-    xt = {(i,j): model.addVar(vtype=GRB.INTEGER, lb=0, ub=m, name=f"xt_{i}_{j}")
-          for (i,j) in graph.trans_arcs}
+    # Loss arc flows: up to m machines can share any loss arc
+    xl = {(i,j): model.addVar(vtype=GRB.INTEGER, lb=0, ub=m, name=f"xl_{i}_{j}")
+          for (i,j) in graph.loss_arcs}
     z  = model.addVar(vtype=GRB.CONTINUOUS, lb=0, name="z")
     model.update()
 
@@ -234,18 +251,18 @@ def solve(inst: BPPMInstance, z_max: int,
         model.addConstr(z >= j * yi[i,j,p])
 
     # ── Source outflow = m ─────────────────────────────────────────────
-    out_0 = (quicksum(xi[0,j,p] for (i,j,p) in graph.item_arcs  if i == 0) +
-             quicksum(xt[0,j]   for (i,j)   in graph.trans_arcs if i == 0))
+    out_0 = (quicksum(xi[0,j,p] for (i,j,p) in graph.item_arcs if i == 0) +
+             quicksum(xl[0,j]   for (i,j)   in graph.loss_arcs  if i == 0))
     model.addConstr(out_0 == m)
 
     # ── Flow conservation ──────────────────────────────────────────────
     for v in graph.nodes:
         if v == 0 or v == UB:
             continue
-        in_f  = (quicksum(xi[i,v,p] for (i,j,p) in graph.item_arcs  if j == v) +
-                 quicksum(xt[i,v]   for (i,j)   in graph.trans_arcs if j == v))
-        out_f = (quicksum(xi[v,j,p] for (i,j,p) in graph.item_arcs  if i == v) +
-                 quicksum(xt[v,j]   for (i,j)   in graph.trans_arcs if i == v))
+        in_f  = (quicksum(xi[i,v,p] for (i,j,p) in graph.item_arcs if j == v) +
+                 quicksum(xl[i,v]   for (i,j)   in graph.loss_arcs  if j == v))
+        out_f = (quicksum(xi[v,j,p] for (i,j,p) in graph.item_arcs if i == v) +
+                 quicksum(xl[v,j]   for (i,j)   in graph.loss_arcs  if i == v))
         if in_f.size() + out_f.size() > 0:
             model.addConstr(in_f == out_f)
 
@@ -258,6 +275,7 @@ def solve(inst: BPPMInstance, z_max: int,
         arcs_T = graph.At.get(inst.T, [])
         model.addConstr(
             quicksum(xi[i,j,inst.T] for (i,j,p) in arcs_T) == inst.full_batch_count)
+
     t0 = time.time()
     model.optimize()
     rt = time.time() - t0
@@ -265,7 +283,7 @@ def solve(inst: BPPMInstance, z_max: int,
     if model.SolCount == 0:
         status = "infeasible" if model.Status == GRB.INFEASIBLE else "timeout"
         return SolveResult(status=status, cmax=None, lb=None, gap=None,
-                           runtime=rt, graph=graph, xi=xi, yi=yi, xt=xt)
+                           runtime=rt, graph=graph, xi=xi, yi=yi, xl=xl)
 
     cmax   = model.ObjVal
     lb_obj = model.ObjBound
@@ -279,16 +297,18 @@ def solve(inst: BPPMInstance, z_max: int,
             if v.X > 0.5:
                 print(f"  type p={p:3d}  x={round(v.X)}  y={round(yi[i,j,p].X)}  "
                       f"batch {i//T}  ({i:3d}→{j:3d})  Cmax_contrib={j}")
-        print("Transition arcs used:")
-        for (i,j), v in sorted(xt.items()):
+        print("Loss arcs used:")
+        for (i,j), v in sorted(xl.items()):
             if v.X > 0.5:
-                print(f"  ({i:3d}→{j:3d}) x{round(v.X)}  batch {i//T}→{j//T}")
+                print(f"  ({i:3d}→{j:3d}) x{round(v.X)}"
+                      + (f"  [batch boundary]" if j % T == 0 else ""))
+
     xi_vals = {k: v.X for k, v in xi.items()}
     yi_vals = {k: v.X for k, v in yi.items()}
-    xt_vals = {k: v.X for k, v in xt.items()}
+    xl_vals = {k: v.X for k, v in xl.items()}
 
     return SolveResult(status=status, cmax=cmax, lb=lb_obj, gap=gap,
-                       runtime=rt, graph=graph, xi=xi_vals, yi=yi_vals, xt=xt_vals)
+                       runtime=rt, graph=graph, xi=xi_vals, yi=yi_vals, xl=xl_vals)
 
 
 # ─────────────────────────────────────────────
@@ -357,14 +377,14 @@ def append_csv(csv_path: str, row: dict):
         w.writerow(row)
 
 def write_solution_file(sol_path: str, inst: BPPMInstance,
-                        cmax: Optional[float], xi: dict, xt: dict,
+                        cmax: Optional[float], xi: dict, xl: dict,
                         yi: dict, graph: "BatchGraph"):
+    T = inst.T
     with open(sol_path, "w") as f:
         if cmax is None:
             f.write("Status: no solution\n"); return
         f.write(f"Cmax: {cmax:.1f}\n")
         f.write(f"n={inst.n}  T={inst.T}  m={inst.m}\n\n")
-        T = inst.T
         for b in range(graph.z_max):
             arcs_in_batch = [(i,j,p) for (i,j,p) in graph.item_arcs if i//T == b]
             used = [(i,j,p,round(xi[i,j,p])) for (i,j,p) in arcs_in_batch
@@ -373,10 +393,11 @@ def write_solution_file(sol_path: str, inst: BPPMInstance,
                 f.write(f"Batch {b} (t=[{b*T},{(b+1)*T}]):\n")
                 for i,j,p,cnt in sorted(used):
                     f.write(f"  arc ({i:4d}->{j:4d})  type p={p:3d}  x{cnt}\n")
-        f.write("\nTransition arcs:\n")
-        for (i,j), v in sorted(xt.items()):
+        f.write("\nLoss arcs used:\n")
+        for (i,j), v in sorted(xl.items()):
             if v > 0.5:
-                f.write(f"  ({i:4d}->{j:4d})  x{round(v)}\n")
+                boundary = "  [batch boundary]" if j % T == 0 else ""
+                f.write(f"  ({i:4d}->{j:4d})  x{round(v)}{boundary}\n")
 
 
 # ─────────────────────────────────────────────
@@ -401,66 +422,66 @@ def run_folder(folder: str, csv_path: str, sol_dir: str = None,
     print("-" * 72)
 
     for idx, fname in enumerate(files, 1):
-            fpath = os.path.join(folder, fname)
-            print(f"[{idx:4d}/{len(files)}] {fname:<32s}", end=" ", flush=True)
-    
-            res = None; inst = None; z_max_used = 0; lb_runtime = 0.0
-    
-            try:
-                inst         = BPPMInstance.from_file(fpath, machines=machines)
-                inst_reflect = SMInstance.from_file(fpath, t_charge=t_charge)
-    
-                t0         = time.time()
-                z_single   = lb_single_machine(inst_reflect)
-                lb_runtime = time.time() - t0
-                z_max      = math.ceil(z_single / machines)
-                z_max_used = z_max
-    
-                res = solve(inst, z_max=z_max, time_limit=time_limit,
-                            verbose=verbose, threads=threads)
-                res.runtime += lb_runtime   # include LB solve in total runtime
-    
-            except Exception as exc:
-                import traceback
-                print(f"ERROR: {exc}")
-                traceback.print_exc()
-    
-            # ── console output ────────────────────────────────────────────
-            if res is not None and res.cmax is not None:
-                gap_s = f"{res.gap*100:.2f}%" if res.gap is not None else "?"
-                print(f"{res.status:8s}  Cmax={res.cmax:>9.1f}  "
-                      f"z_max={z_max_used:>3d}  gap={gap_s:>8s}  {res.runtime:.2f}s")
-            else:
-                status = res.status if res is not None else "error"
-                rt     = res.runtime if res is not None else 0.0
-                print(f"{status}  {rt:.2f}s")
-    
-            # ── CSV ───────────────────────────────────────────────────────
-            append_csv(csv_path, {
-                "instance":     fname,
-                "n":            inst.n if inst else "",
-                "T":            inst.T if inst else "",
-                "m":            machines,
-                "status":       res.status  if res  else "error",
-                "cmax":         f"{res.cmax:.1f}"        if res and res.cmax is not None else "",
-                "lb":           f"{res.lb:.2f}"          if res and res.lb   is not None else "",
-                "gap_pct":      f"{res.gap*100:.4f}"     if res and res.gap  is not None else "",
-                "z_max":        z_max_used,
-                "runtime_s":    f"{res.runtime:.3f}"     if res else "0.000",
-                "runtime_phase1": f"{lb_runtime:.3f}",
-                "model":        "batch_graph_int",
-                "numOfThreads": threads,
-                "set":          set_name,
-            })
-    
-            # ── solution file ─────────────────────────────────────────────
-            if sol_dir and res is not None and res.cmax is not None:
-                write_solution_file(
-                    os.path.join(sol_dir, fname + ".sol"),
-                    inst, res.cmax, res.xi, res.xt, res.yi, res.graph)
-    
-            print("-" * 72)
-            print(f"Done. Results -> {csv_path}")
+        fpath = os.path.join(folder, fname)
+        print(f"[{idx:4d}/{len(files)}] {fname:<32s}", end=" ", flush=True)
+
+        res = None; inst = None; z_max_used = 0; lb_runtime = 0.0
+
+        try:
+            inst         = BPPMInstance.from_file(fpath, machines=machines)
+            inst_reflect = SMInstance.from_file(fpath, t_charge=t_charge)
+
+            t0         = time.time()
+            z_single   = lb_single_machine(inst_reflect)
+            lb_runtime = time.time() - t0
+            z_max      = math.ceil(z_single / machines)
+            z_max_used = z_max
+
+            res = solve(inst, z_max=z_max, time_limit=time_limit,
+                        verbose=verbose, threads=threads)
+            res.runtime += lb_runtime
+
+        except Exception as exc:
+            import traceback
+            print(f"ERROR: {exc}")
+            traceback.print_exc()
+
+        # ── console output ────────────────────────────────────────────
+        if res is not None and res.cmax is not None:
+            gap_s = f"{res.gap*100:.2f}%" if res.gap is not None else "?"
+            print(f"{res.status:8s}  Cmax={res.cmax:>9.1f}  "
+                  f"z_max={z_max_used:>3d}  gap={gap_s:>8s}  {res.runtime:.2f}s")
+        else:
+            status = res.status if res is not None else "error"
+            rt     = res.runtime if res is not None else 0.0
+            print(f"{status}  {rt:.2f}s")
+
+        # ── CSV ───────────────────────────────────────────────────────
+        append_csv(csv_path, {
+            "instance":       fname,
+            "n":              inst.n if inst else "",
+            "T":              inst.T if inst else "",
+            "m":              machines,
+            "status":         res.status  if res  else "error",
+            "cmax":           f"{res.cmax:.1f}"        if res and res.cmax is not None else "",
+            "lb":             f"{res.lb:.2f}"          if res and res.lb   is not None else "",
+            "gap_pct":        f"{res.gap*100:.4f}"     if res and res.gap  is not None else "",
+            "z_max":          z_max_used,
+            "runtime_s":      f"{res.runtime:.3f}"     if res else "0.000",
+            "runtime_phase1": f"{lb_runtime:.3f}",
+            "model":          "batch_graph_loss",
+            "numOfThreads":   threads,
+            "set":            set_name,
+        })
+
+        # ── solution file ─────────────────────────────────────────────
+        if sol_dir and res is not None and res.cmax is not None:
+            write_solution_file(
+                os.path.join(sol_dir, fname + ".sol"),
+                inst, res.cmax, res.xi, res.xl, res.yi, res.graph)
+
+        print("-" * 72)
+    print(f"Done. Results -> {csv_path}")
 
 
 # ─────────────────────────────────────────────
@@ -473,76 +494,59 @@ def reconstruct_schedule(inst: BPPMInstance, res: SolveResult) -> List[Dict]:
 
     Algorithm: standard flow-path decomposition on a DAG.
       - One pass per machine = one unit of flow from node 0 to UB.
-      - At each node, greedily follow item arcs (collecting items),
-        then take one transition arc to the next batch boundary.
-
-    Returns list of m dicts  {batch_index -> [processing_times]}.
+      - At each node, greedily follow item arcs (collecting items);
+        if no item arc is available, follow a loss arc to advance.
+      - Batch index is inferred from node // T at each step.
     """
-    from collections import defaultdict
-
     graph = res.graph
     T, m  = inst.T, inst.m
     UB    = graph.UB
 
-    # Mutable integer flow copies
     xi = defaultdict(int, {k: round(v) for k, v in res.xi.items() if v > 0.5})
-    xt = defaultdict(int, {k: round(v) for k, v in res.xt.items() if v > 0.5})
+    xl = defaultdict(int, {k: round(v) for k, v in res.xl.items() if v > 0.5})
 
-    # Outgoing arc lookups (sorted for determinism)
     item_out: Dict[int, List] = defaultdict(list)
     for arc in sorted(graph.item_arcs):
         item_out[arc[0]].append(arc)
 
-    trans_out: Dict[int, List] = defaultdict(list)
-    for arc in sorted(graph.trans_arcs):
-        trans_out[arc[0]].append(arc)
+    loss_out: Dict[int, List] = defaultdict(list)
+    for arc in sorted(graph.loss_arcs):
+        loss_out[arc[0]].append(arc)
 
     machines = []
 
     for machine_num in range(m):
         node     = 0
-        schedule: Dict[int, List[int]] = {}   # batch_b -> [p, ...]
+        schedule: Dict[int, List[int]] = {}
 
         while node != UB:
             b           = node // T
-            batch_items: List[int] = []
+            batch_items = schedule.setdefault(b, [])
 
-            # Follow item arcs, recording batch crossings on the fly.
-            # An arc (i, j, p) can land on j = (b+1)*T (batch boundary),
-            # so j // T may be b+1.  When that happens save the current
-            # batch and start accumulating for the new one immediately.
-            while True:
-                moved = False
-                for arc in item_out[node]:
-                    i, j, p = arc
-                    if xi[arc] > 0:
-                        batch_items.append(p)
-                        xi[arc] -= 1
-                        node = j
-                        moved = True
-                        break    # restart from new node
-                if not moved:
+            # Try an item arc first
+            moved = False
+            for arc in item_out[node]:
+                i, j, p = arc
+                if xi[arc] > 0:
+                    batch_items.append(p)
+                    xi[arc] -= 1
+                    node = j
+                    moved = True
                     break
-                # Detect batch boundary crossing mid-path
+
+            if moved:
+                # Detect batch boundary crossing
                 new_b = node // T
                 if new_b != b:
-                    if batch_items:
-                        schedule[b] = batch_items
-                    batch_items = []
-                    b = new_b
+                    schedule.setdefault(new_b, [])
+                continue
 
-            if batch_items:
-                schedule[b] = batch_items
-
-            if node == UB:
-                break
-
-            # Take one transition arc to next batch boundary
+            # No item arc available — follow a loss arc to advance
             taken = False
-            for arc in trans_out[node]:
+            for arc in loss_out[node]:
                 i, j = arc
-                if xt[arc] > 0:
-                    xt[arc] -= 1
+                if xl[arc] > 0:
+                    xl[arc] -= 1
                     node = j
                     taken = True
                     break
@@ -551,6 +555,8 @@ def reconstruct_schedule(inst: BPPMInstance, res: SolveResult) -> List[Dict]:
                 print(f"  WARNING machine {machine_num}: stuck at node {node}")
                 break
 
+        # Drop empty batch slots
+        schedule = {b: items for b, items in schedule.items() if items}
         machines.append(schedule)
 
     return machines
@@ -562,15 +568,12 @@ def format_schedule(inst: BPPMInstance, machines: List[Dict],
     Format machine schedules as a human-readable string,
     mapping processing times back to original job indices.
     """
-    from collections import defaultdict
-
     lines = []
     if cmax is not None:
         lines.append(f"Cmax = {cmax:.1f}")
     lines.append(f"n={inst.n}  T={inst.T}  m={inst.m}")
     lines.append("")
 
-    # Build job pool: p -> [job_indices] (consumed as we assign)
     pool: Dict[int, List[int]] = defaultdict(list)
     for idx, p in enumerate(inst.jobs):
         pool[p].append(idx)
@@ -581,7 +584,6 @@ def format_schedule(inst: BPPMInstance, machines: List[Dict],
         for b in active_batches:
             ptimes  = schedule[b]
             indices = sorted(pool[p].pop(0) for p in ptimes)
-            # compute actual completion: cumulative sum within batch
             pos = b * inst.T
             for p in ptimes:
                 pos += p
@@ -633,13 +635,13 @@ def run_single(fpath: str,
 if __name__ == "__main__":
     #"""
     # --- single instance ---
-    setstr = "Set1"
-    file   = "L_00000702"
+    setstr = "MOD"
+    file   = "L_00000369"
     result = run_single(
-        f"Benchmark Instances/New Instances/{setstr}/{file}",
+        f"Benchmark Instances/Instances/{setstr}/{file}",
         t_charge   = 0,
         time_limit = 100,
-        machines   = 10,
+        machines   = 2,
     )
     print(f"Final Cmax: {result.cmax}")
     #"""
@@ -648,8 +650,8 @@ if __name__ == "__main__":
     folder = "MOD"
     run_folder(
         folder     = f"Benchmark Instances/Instances/{folder}/",
-        csv_path   = f"results/{folder}_new_arcflow_2m.csv",
-        sol_dir    = f"results/{folder}_new_arcflow_2m_sol/",
+        csv_path   = f"results/{folder}_new_arcflow_2m_BrandaoSymm.csv",
+        sol_dir    = f"results/{folder}_new_arcflow_2m_BrandaoSymm_sol/",
         t_charge   = 0,
         time_limit = 720.0,
         threads    = 1,
