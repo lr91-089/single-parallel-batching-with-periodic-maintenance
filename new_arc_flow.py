@@ -422,65 +422,66 @@ def run_folder(folder: str, csv_path: str, sol_dir: str = None,
     print("-" * 72)
 
     for idx, fname in enumerate(files, 1):
-        fpath = os.path.join(folder, fname)
-        print(f"[{idx:4d}/{len(files)}] {fname:<32s}", end=" ", flush=True)
-
-        res = None; inst = None; z_max_used = 0; lb_runtime = 0.0
-
-        try:
-            inst         = BPPMInstance.from_file(fpath, machines=machines)
-            inst_reflect = SMInstance.from_file(fpath, t_charge=t_charge)
-
-            t0         = time.time()
-            z_single   = lb_single_machine(inst_reflect)
-            lb_runtime = time.time() - t0
-            z_max      = math.ceil(z_single / machines)
-            z_max_used = z_max
-
-            res = solve(inst, z_max=z_max, time_limit=time_limit,
-                        verbose=verbose, threads=threads)
-            res.runtime += lb_runtime
-
-        except Exception as exc:
-            import traceback
-            print(f"ERROR: {exc}")
-            traceback.print_exc()
-
-        # ── console output ────────────────────────────────────────────
-        if res is not None and res.cmax is not None:
-            gap_s = f"{res.gap*100:.2f}%" if res.gap is not None else "?"
-            print(f"{res.status:8s}  Cmax={res.cmax:>9.1f}  "
-                  f"z_max={z_max_used:>3d}  gap={gap_s:>8s}  {res.runtime:.2f}s")
-        else:
-            status = res.status if res is not None else "error"
-            rt     = res.runtime if res is not None else 0.0
-            print(f"{status}  {rt:.2f}s")
-
-        # ── CSV ───────────────────────────────────────────────────────
-        append_csv(csv_path, {
-            "instance":       fname,
-            "n":              inst.n if inst else "",
-            "T":              inst.T if inst else "",
-            "m":              machines,
-            "status":         res.status  if res  else "error",
-            "cmax":           f"{res.cmax:.1f}"        if res and res.cmax is not None else "",
-            "lb":             f"{res.lb:.2f}"          if res and res.lb   is not None else "",
-            "gap_pct":        f"{res.gap*100:.4f}"     if res and res.gap  is not None else "",
-            "z_max":          z_max_used,
-            "runtime_s":      f"{res.runtime:.3f}"     if res else "0.000",
-            "runtime_phase1": f"{lb_runtime:.3f}",
-            "model":          "batch_graph_loss",
-            "numOfThreads":   threads,
-            "set":            set_name,
-        })
-
-        # ── solution file ─────────────────────────────────────────────
-        if sol_dir and res is not None and res.cmax is not None:
-            write_solution_file(
-                os.path.join(sol_dir, fname + ".sol"),
-                inst, res.cmax, res.xi, res.xl, res.yi, res.graph)
-
-        print("-" * 72)
+        if idx>694:
+            fpath = os.path.join(folder, fname)
+            print(f"[{idx:4d}/{len(files)}] {fname:<32s}", end=" ", flush=True)
+    
+            res = None; inst = None; z_max_used = 0; lb_runtime = 0.0
+    
+            try:
+                inst         = BPPMInstance.from_file(fpath, machines=machines)
+                inst_reflect = SMInstance.from_file(fpath, t_charge=t_charge)
+    
+                t0         = time.time()
+                z_single   = lb_single_machine(inst_reflect)
+                lb_runtime = time.time() - t0
+                z_max      = math.ceil(z_single / machines)
+                z_max_used = z_max
+    
+                res = solve(inst, z_max=z_max, time_limit=time_limit,
+                            verbose=verbose, threads=threads)
+                res.runtime += lb_runtime
+    
+            except Exception as exc:
+                import traceback
+                print(f"ERROR: {exc}")
+                traceback.print_exc()
+    
+            # ── console output ────────────────────────────────────────────
+            if res is not None and res.cmax is not None:
+                gap_s = f"{res.gap*100:.2f}%" if res.gap is not None else "?"
+                print(f"{res.status:8s}  Cmax={res.cmax:>9.1f}  "
+                      f"z_max={z_max_used:>3d}  gap={gap_s:>8s}  {res.runtime:.2f}s")
+            else:
+                status = res.status if res is not None else "error"
+                rt     = res.runtime if res is not None else 0.0
+                print(f"{status}  {rt:.2f}s")
+    
+            # ── CSV ───────────────────────────────────────────────────────
+            append_csv(csv_path, {
+                "instance":       fname,
+                "n":              inst.n if inst else "",
+                "T":              inst.T if inst else "",
+                "m":              machines,
+                "status":         res.status  if res  else "error",
+                "cmax":           f"{res.cmax:.1f}"        if res and res.cmax is not None else "",
+                "lb":             f"{res.lb:.2f}"          if res and res.lb   is not None else "",
+                "gap_pct":        f"{res.gap*100:.4f}"     if res and res.gap  is not None else "",
+                "z_max":          z_max_used,
+                "runtime_s":      f"{res.runtime:.3f}"     if res else "0.000",
+                "runtime_phase1": f"{lb_runtime:.3f}",
+                "model":          "batch_graph_loss",
+                "numOfThreads":   threads,
+                "set":            set_name,
+            })
+    
+            # ── solution file ─────────────────────────────────────────────
+            if sol_dir and res is not None and res.cmax is not None:
+                write_solution_file(
+                    os.path.join(sol_dir, fname + ".sol"),
+                    inst, res.cmax, res.xi, res.xl, res.yi, res.graph)
+    
+            print("-" * 72)
     print(f"Done. Results -> {csv_path}")
 
 
@@ -636,7 +637,7 @@ if __name__ == "__main__":
     #"""
     # --- single instance ---
     setstr = "MOD"
-    file   = "L_00000369"
+    file   = "L_00000696"
     result = run_single(
         f"Benchmark Instances/Instances/{setstr}/{file}",
         t_charge   = 0,
@@ -645,13 +646,14 @@ if __name__ == "__main__":
     )
     print(f"Final Cmax: {result.cmax}")
     #"""
+    
     """
     # --- full folder ---
     folder = "MOD"
     run_folder(
         folder     = f"Benchmark Instances/Instances/{folder}/",
-        csv_path   = f"results/{folder}_new_arcflow_2m_BrandaoSymm.csv",
-        sol_dir    = f"results/{folder}_new_arcflow_2m_BrandaoSymm_sol/",
+        csv_path   = f"results/{folder}_new_arcflow_2m_BrandaoSymm_missing.csv",
+        #sol_dir    = f"results/{folder}_new_arcflow_2m_BrandaoSymm_sol/",
         t_charge   = 0,
         time_limit = 720.0,
         threads    = 1,

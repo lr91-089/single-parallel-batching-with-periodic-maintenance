@@ -416,17 +416,14 @@ class ArcFlowReflectSMSP:
                   for t, d in inst.item_types.items() for k in M if k>0}
             for t, d in inst.item_types.items():
                 y[t,0] = m.addVar(vtype=GRB.INTEGER, lb=0, ub=d, name=f"y_{t}_0")
-            u  = {(t, k): m.addVar(vtype=GRB.INTEGER, lb=0, ub=d, name=f"u_{t}_{k}")
+            u  = {k: m.addVar(vtype=GRB.INTEGER, lb=0, name=f"u_{t}_{k}")
                   for t, d in inst.item_types.items() for k in M}
-            for k in M:
-                u[-1, k] = m.addVar(vtype=GRB.INTEGER, lb=0, name=f"u_{-1}_{k}")
-            ub = {k: m.addVar(vtype=GRB.INTEGER, lb=0, ub=inst.full_bin_count, name=f"ub_{k}")
-                  for k in M}
+
             Cmax = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="Cmax")
         else:
             y  = {t: m.addVar(vtype=GRB.CONTINUOUS, lb=0, ub=d, name=f"y_{t}")
                   for t, d in inst.item_types.items()}
-            u = ub = None
+            u = None
         m.update()
 
         self._add_flow_conservation(m, xi_s, xi_r)
@@ -437,51 +434,26 @@ class ArcFlowReflectSMSP:
 
         if self.machines > 1:
             # u linkage: sum_k u[t,k] = reflect flow for item type t
-            for t in inst.item_types:
-                z_k = quicksum(xi_r[d, e, t1] for (d, e, t1) in graph.R_arcs if t1 == t)
-                m.addConstr(quicksum(u[t, k] for k in M) == z_k, name=f"u_link_{t}")
+            z_k = quicksum(xi_r[d, e, t1] for (d, e, t1) in graph.R_arcs)
+            m.addConstr(quicksum(u[k] for k in M) == z_k+inst.full_bin_count, name=f"u_link_bins")
 
-            z_loss = quicksum(xi_r[d, e, t1] for (d, e, t1) in graph.R_arcs if t1 is None)
-            m.addConstr(quicksum(u[-1, k] for k in M) == z_loss, name="u_link_loss")
-
-            m.addConstr(quicksum(ub[k] for k in M) == inst.full_bin_count, name="ub_split")
 
             for k in M:
                 m.addConstr(quicksum(t * y[t, k] for t in inst.item_types) <= T,
                             name=f"last_cap_{k}")
-                total_bins_k = (quicksum(u[t, k] for t in inst.item_types)
-                                + u[-1, k] + ub[k])
                 m.addConstr(
-                    total_bins_k * (T + tc)
+                    u[k] * (T + tc)
                     + quicksum(t * y[t, k] for t in inst.item_types) <= Cmax,
                     name=f"cmax_{k}")
             # Symmetry-breaking
-                
-            #if k > 1:
-                """
+            """
+            if k > 1:
                 for k in M[1:]:
-                    total_bins_k = (quicksum(u[t, k] for t in inst.item_types)
-                                    + u[-1, k] + ub[k]+ quicksum(t * y[t, k] for t in inst.item_types))
-                    total_bins_k_min_1 = (quicksum(u[t,k-1] for t in inst.item_types)
-                                    + u[-1, k-1] + ub[k-1]+ quicksum(t * y[t, k-1] for t in inst.item_types))
+                    total_bins_k = u[k]
+                    total_bins_k_min_1 = u[k-1]
                     m.addConstr(
-                    total_bins_k  <= total_bins_k_min_1) """
-                """
-                    total_bins_k = (quicksum(u[t, k] for t in inst.item_types)
-                                    + u[-1, k] + ub[k])
-                    total_bins_k_min_1 = (quicksum(u[t,k-1] for t in inst.item_types)
-                                    + u[-1, k-1] + ub[k-1])
-                    m.addConstr(
-                    total_bins_k * (T + tc)
-                    + quicksum(t * y[t, k] for t in inst.item_types) <= total_bins_k_min_1 * (T + tc)
-                    + quicksum(t * y[t, k-1] for t in inst.item_types)
-                    )"""
-                """
-                if k > 0:
-                    for k in M[1:]:
-                        m.addConstr(
-                            quicksum(y[t, k] for t in inst.item_types)<= quicksum(y[t1, k - 1] for t1 in inst.item_types),
-                                name=f"sym_{t}_{k}")#"""
+                    total_bins_k  <= total_bins_k_min_1)"""
+
 
             cmax_lb = math.ceil(sum(inst.jobs) / self.machines)
             m.addConstr(Cmax >= cmax_lb, name="cmax_lb_load")
@@ -496,12 +468,12 @@ class ArcFlowReflectSMSP:
                 
         
         # Log file for root-gap extraction
-        m.Params.LogFile       = "gurobi_run3.log"
+        m.Params.LogFile       = "gurobi_run.log"
         m.Params.LogToConsole  = 1
         m._root_obj            = None
 
         self._model = m; self._xi_s = xi_s; self._xi_r = xi_r; self._y = y
-        self._u = u; self._ub = ub
+        self._u = u
         return m
 
     # ------------------------------------------------------------------
@@ -558,7 +530,7 @@ class ArcFlowReflectSMSP:
             m._phase1_root_gap = None
             m._phase2_ready    = False
             self._model = m; self._xi_s = xi_s; self._xi_r = xi_r
-            self._u = None; self._ub = None
+            self._u = None
             return m
 
         z_opt = round(m.ObjVal)
@@ -579,17 +551,14 @@ class ArcFlowReflectSMSP:
                   for t, d in inst.item_types.items() for k in M if k >0}
             for t, d in inst.item_types.items():
                 y[t, 0] =  m.addVar(vtype=GRB.CONTINUOUS, lb=0, ub=d, name=f"y_{t}_0")
-            u  = {(t, k): m.addVar(vtype=GRB.INTEGER, lb=0, ub=d, name=f"u_{t}_{k}")
-                  for t, d in inst.item_types.items() for k in M}
-            for k in M:
-                u[-1, k] = m.addVar(vtype=GRB.INTEGER, lb=0, name=f"u_{-1}_{k}")
-            ub = {k: m.addVar(vtype=GRB.INTEGER, lb=0, ub=inst.full_bin_count,
-                              name=f"ub_{k}") for k in M}
+            u  = {k: m.addVar(vtype=GRB.INTEGER, lb=0, name=f"u_{k}")
+                   for k in M if k>0}
+            u[0] = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="u_0")
             Cmax = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="Cmax")
         else:
             y    = {t: m.addVar(vtype=GRB.CONTINUOUS, lb=0, ub=d, name=f"y_{t}")
                     for t, d in inst.item_types.items()}
-            u = ub = None
+            u = None
             
         # Re-add demand constraints in per-machine form
         self._add_demand_constraints(m, xi_s, xi_r, y, z_expr,
@@ -602,30 +571,23 @@ class ArcFlowReflectSMSP:
 
         m.update()
         if self.machines > 1:
-            for t in inst.item_types:
-                z_k = quicksum(xi_r[d, e, t1] for (d, e, t1) in graph.R_arcs if t1 == t)
-                m.addConstr(quicksum(u[t, k] for k in M) == z_k, name=f"u_link_{t}")
-            z_loss = quicksum(xi_r[d, e, t1] for (d, e, t1) in graph.R_arcs if t1 is None)
-            m.addConstr(quicksum(u[-1, k] for k in M) == z_loss, name="u_link_loss")
-            m.addConstr(quicksum(ub[k] for k in M) == inst.full_bin_count, name="ub_split")
+            z_k = quicksum(xi_r[d, e, t1] for (d, e, t1) in graph.R_arcs)
+            m.addConstr(quicksum(u[k] for k in M) == z_k+inst.full_bin_count, name=f"u_link_{t}")
 
             for k in M:
                 m.addConstr(quicksum(t * y[t, k] for t in inst.item_types) <= T,
                             name=f"last_cap_{k}")
-                total_bins_k = (quicksum(u[t, k] for t in inst.item_types)
-                                + u[-1, k] + ub[k])
                 m.addConstr(
-                    total_bins_k * (T + tc)
+                    u[k] * (T + tc)
                     + quicksum(t * y[t, k] for t in inst.item_types) <= Cmax,
                     name=f"cmax_{k}")
+                #"""
                 if k > 1:
                     for k in M[1:]:
-                        total_bins_k = (quicksum(u[t, k] for t in inst.item_types)
-                                       + u[-1, k] + ub[k]+ quicksum(t * y[t, k] for t in inst.item_types))
-                        total_bins_k_min_1 = (quicksum(u[t,k-1] for t in inst.item_types)
-                                       + u[-1, k-1] + ub[k-1]+ quicksum(t * y[t, k-1] for t in inst.item_types))
+                        total_bins_k = u[k]
+                        total_bins_k_min_1 = u[k-1]
                         m.addConstr(
-                        total_bins_k  <= total_bins_k_min_1) 
+                        total_bins_k  <= total_bins_k_min_1) #"""
 
             cmax_lb = math.ceil(sum(inst.jobs) / self.machines)
             m.addConstr(Cmax >= cmax_lb, name="cmax_lb_load")
@@ -644,7 +606,7 @@ class ArcFlowReflectSMSP:
         m._phase2_ready    = True
 
         self._model = m; self._xi_s = xi_s; self._xi_r = xi_r; self._y = y
-        self._u = u; self._ub = ub
+        self._u = u
         return m
     
     # ------------------------------------------------------------------
@@ -663,9 +625,9 @@ class ArcFlowReflectSMSP:
         m = self._model; t0 = time.time()
         m.optimize()
         m.Params.LogFile = ""          # release file handle
-        root_gap, _, _ = _get_root_gap_from_log("gurobi_run3.log")
+        root_gap, _, _ = _get_root_gap_from_log("gurobi_run.log")
         try:
-            os.remove("gurobi_run3.log")
+            os.remove("gurobi_run.log")
         except OSError:
             pass
         rt = time.time() - t0; st = m.Status
@@ -753,8 +715,8 @@ class ArcFlowReflectSMSP:
         if self.machines > 1:
             # Phase 2 objective is Cmax directly
             cmax      = m.ObjVal
-            last_load = sum(t * self._y[t, k].X
-                            for t in self.inst.item_types
+            last_load = max(sum(t * self._y[t, k].X
+                            for t in self.inst.item_types)
                             for k in range(self.machines))
             lb        = m.ObjBound
             gap       = m.MIPGap
@@ -815,29 +777,23 @@ class ArcFlowReflectSMSP:
             # we consume from it sequentially per machine.
             bin_iter = iter(range(len(bins_ptimes)))
             machine_assignments = {}
-            for k in range(self.machines):
-                n_bins_k = (sum(round(self._u[t, k].X) for t in inst.item_types)
-                            + round(self._u[-1, k].X)
-                            + round(self._ub[k].X))
-                # Take the next n_bins_k bins from the flat list
-                k_bin_indices = [next(bin_iter) for _ in range(n_bins_k)]
-                k_bins_ptimes  = [bins_ptimes[i]  for i in k_bin_indices]
-                k_bins_idx     = [bins_idx[i]      for i in k_bin_indices]
-                last_k_ptimes = []
-                for t in sorted(inst.item_types):
-                    last_k_ptimes.extend([t] * round(self._y[t, k].X))
-                last_k_ptimes.sort()
-                last_k_indices = sorted(full_pool[p].pop(0) for p in last_k_ptimes)
-                machine_assignments[k] = {
-                    "bins_ptimes":  k_bins_ptimes,
-                    "bins_indices": k_bins_idx,
-                    "last_ptimes":  last_k_ptimes,
-                    "last_indices": last_k_indices,
-                }
-            last_ptimes = sorted(p for k in range(self.machines)
-                                 for p in machine_assignments[k]["last_ptimes"])
-            last_idx    = sorted(i for k in range(self.machines)
-                                 for i in machine_assignments[k]["last_indices"])
+            if self.machines > 1:
+                machine_assignments = {}
+                for k in range(self.machines):
+                    last_k_ptimes = []
+                    for t in sorted(inst.item_types):
+                        last_k_ptimes.extend([t] * round(self._y[t, k].X))
+                    last_k_ptimes.sort()
+                    last_k_indices = sorted(full_pool[p].pop(0) for p in last_k_ptimes)
+                    machine_assignments[k] = {
+                        "n_bins":       round(self._u[k].X),
+                        "last_ptimes":  last_k_ptimes,
+                        "last_indices": last_k_indices,
+                    }
+                last_ptimes = sorted(p for k in range(self.machines)
+                                     for p in machine_assignments[k]["last_ptimes"])
+                last_idx    = sorted(i for k in range(self.machines)
+                                     for i in machine_assignments[k]["last_indices"])
         else:
             machine_assignments = None
             last_ptimes: List[int] = []
@@ -864,35 +820,33 @@ class ArcFlowReflectSMSP:
 # ─────────────────────────────────────────────
 
 def _format_solution(res: SolverResult) -> str:
-    """Return the solution as a formatted string (shared by file writer and console)."""
     if res.cmax is None:
         return f"Status: {res.status}\nNo feasible solution found.\n"
 
     lines = []
-    lines.append(f"The num of Batches: {res.z_nonlast}")
-    lines.append(f"makespan: {res.cmax}")
+    lines.append(f"Makespan : {res.cmax}")
+    lines.append(f"Total non-last bins: {res.z_nonlast}")
+    lines.append("")
+
+    # All shared batches
+    lines.append("=== Shared batches (all machines) ===")
+    for b, (idx, pt) in enumerate(zip(res.bins_indices, res.bins_ptimes)):
+        lines.append(f"  Batch {b}: jobs={idx}  load={sum(pt)}")
 
     if res.machine_assignments is None:
-        # Single-machine: flat batch list + single last bin
-        lines.append("The jobs in each Batch")
-        for b, (idx, pt) in enumerate(zip(res.bins_indices, res.bins_ptimes)):
-            lines.append(f"Batch{b}:index:{idx} Processing Time: {sum(pt)}")
-        lines.append("The last Batch")
-        lines.append(f"index:{res.last_indices} "
-                     f"Processing Time: {sum(res.last_ptimes or [])}")
+        # Single machine
+        lines.append("")
+        lines.append("=== Last batch ===")
+        lines.append(f"  jobs={res.last_indices}  load={sum(res.last_ptimes or [])}")
     else:
-        # Parallel-machine: shared batch list, then per-machine breakdown
-        lines.append("The jobs in each Batch")
-        for b, (idx, pt) in enumerate(zip(res.bins_indices, res.bins_ptimes)):
-            lines.append(f"Batch{b}:index:{idx} Processing Time: {sum(pt)}")
-        lines.append("--- Per-Machine Assignment ---")
+        # Per-machine summary
+        lines.append("")
+        lines.append("=== Per-machine summary ===")
         for k, asgn in res.machine_assignments.items():
-            n_bins = len(asgn["bins_ptimes"])
-            lines.append(f"\nMachine {k}  ({n_bins} non-last bin(s)):")
-            for b, (idx, pt) in enumerate(zip(asgn["bins_indices"], asgn["bins_ptimes"])):
-                lines.append(f"  Batch{b}:index:{idx} Processing Time: {sum(pt)}")
-            lines.append(f"  Last bin: index:{asgn['last_indices']}  "
-                         f"Processing Time: {sum(asgn['last_ptimes'])}")
+            lines.append(
+                f"  Machine {k}: {asgn['n_bins']} non-last bin(s) | "
+                f"last batch: jobs={asgn['last_indices']}  load={sum(asgn['last_ptimes'])}"
+            )
 
     return "\n".join(lines) + "\n"
 
@@ -970,20 +924,7 @@ def run_folder(folder, csv_path, sol_dir=None, t_charge=0,
     set_name = os.path.basename(os.path.normpath(folder))
 
     for i, fname in enumerate(files, 1):
-        if i-1>0 and i-1 in [132,
-                163,
-                192,
-                151,
-                246,
-                200,
-                224,
-                182,
-                53,
-                245,
-                216,
-                73,
-                172,
-                61]:
+        #if i>194:
             fpath = os.path.join(folder, fname)
             print(f"[{i:4d}/{len(files)}] {fname:<32s}", end=" ", flush=True)
             try:
@@ -1071,17 +1012,17 @@ def run_single(fpath, csv_path=None, sol_dir=None, t_charge=0,
 
 #"""
 # --- Folder run, single-phase, 2 machines ---
-"""
+
 folder = "MOD"
 run_folder(
     folder     = f"Benchmark Instances/Instances/{folder}/",
-    csv_path   = f"results/{folder}_results_5M_symmCont_strengthened_part3.csv",
-    sol_dir    = f"results/{folder}_solutions_5M_symmCont_strengthened3",
+    csv_path   = f"results/{folder}_results_10M_improved_version_y_imp2.csv",
+    #sol_dir    = f"results/{folder}_solutions_10M_improved_version_y_2p_impSymmBreak",
     t_charge   = 0, 
     time_limit = 720.0,
     threads    = 1,
     verbose    = True,
-    machines   = 5,
+    machines   = 10,
     two_phase  = False,
 )
 #"""
@@ -1105,12 +1046,12 @@ run_folder(
 """
 # --- Single instance run ---
 setstr = "MOD"
-file   = "L_00000262"
+file   = "L_00000070"
 result = run_single(
     f"Benchmark Instances/Instances/{setstr}/{file}",
     t_charge   = 0,
     time_limit = 20,
-    machines   = 5,
+    machines   = 10,
     two_phase  = False,
 )
 print(result.cmax, result.z_nonlast, result.last_load)
