@@ -15,6 +15,8 @@ any per-machine u[t,k]/ub[k] assignment variables.
 from __future__ import annotations
 import argparse, csv, math, os, re, time
 from collections import defaultdict
+
+from itertools import groupby
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -114,57 +116,77 @@ class ReflectGraph:
 # ─────────────────────────────────────────────
 
 class LastBatchGraph:
-    def __init__(self, inst: SMInstance):
+    """
+    Arc-flow graph for the last batch on each machine.
+
+    Uses J_binary: every job j in {0,...,n-1} is a distinct item with
+    processing time p_j and demand 1.  Arcs are keyed by job id so xi[arc]
+    is naturally binary-valued (each job placed at most once).
+
+    at_by_type : Dict[int, List[Tuple[int,int,int]]]
+        Maps processing time t → list of (node_in, node_out, job_id) arcs
+        for every job with p_j == t.  Used by the demand constraint to link
+        the last-batch graph to the reflect graph.
+    """
+
+    def __init__(self, inst: "SMInstance"):
         self.T            = inst.T
-        self.types_sorted = sorted(inst.item_types.keys(), reverse=True)
-        self.item_arcs:  List[Tuple[int, int, int]] = []
-        self.loss_arcs:  List[Tuple[int, int]]      = []   # (v, T)
-        self.nodes:      Set[int]                   = set()
-        self._arc_set:   Set[Tuple[int, int, int]]  = set()
-        self._build(inst)
+        # jobs_binary: list of (job_id, p_j) for all non-full-bin jobs
+        self.jobs_binary: List[Tuple[int, int]] = [
+            (idx, p)
+            for idx, p in enumerate(inst.jobs)
+            if p < inst.T                        # full-bin jobs go straight to bins
+        ]
+        self.item_arcs:   List[Tuple[int, int, int]] = []   # (node_in, node_out, job_id)
+        self.loss_arcs:   List[Tuple[int, int]]      = []   # (v, T)
+        self.nodes:       Set[int]                   = set()
+        self._arc_set:    Set[Tuple[int, int, int]]  = set()
 
-    def _build(self, inst: SMInstance):
-        T       = self.T
-        n_types = len(self.types_sorted)
-        level_nodes: Dict[int, Set[int]] = defaultdict(set)
-        level_nodes[0].add(0)
-        self.nodes.add(0)
-        for lev, p in enumerate(self.types_sorted):
-            frontier = list(level_nodes[lev])
-            while frontier:
-                next_frontier = []
-                for pos in frontier:
-                    j = pos + p
-                    if j <= T:
-                        arc = (pos, j, p)
-                        if arc not in self._arc_set:
-                            self._arc_set.add(arc)
-                            self.item_arcs.append(arc)
-                        if j not in level_nodes[lev]:
-                            level_nodes[lev].add(j)
-                            self.nodes.add(j)
-                            next_frontier.append(j)
-                frontier = next_frontier
-            if lev < n_types - 1:
-                for pos in level_nodes[lev]:
-                    if pos not in level_nodes[lev + 1]:
-                        level_nodes[lev + 1].add(pos)
-                        self.nodes.add(pos)
-        self.nodes.add(T)
-        # loss arcs: every non-sink node -> T
-        for v in self.nodes:
-            if v != T:
-                self.loss_arcs.append((v, T))
+        # group jobs by processing time for graph construction
+        self._type_jobs: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        for jid, p in self.jobs_binary:
+            self._type_jobs[p].append((jid, p))
 
-    @property
-    def At(self) -> Dict[int, List[Tuple]]:
-        result: Dict[int, List] = defaultdict(list)
+        self._types_sorted = sorted(self._type_jobs.keys(), reverse=True)
+        self._build()
+
+        # at_by_type: p -> arcs whose job has processing time p
+        self.at_by_type: Dict[int, List[Tuple[int, int, int]]] = defaultdict(list)
         for arc in self.item_arcs:
-            result[arc[2]].append(arc)
-        return result
+            node_in, node_out, jid = arc
+            # recover p from job list
+            p_j = next(p for (j, p) in self.jobs_binary if j == jid)
+            self.at_by_type[p_j].append(arc)
+
+    def _build(self):
+        T = self.T
+        # Process jobs in decreasing p order, ascending job_id within same p
+        jobs_sorted = sorted(self.jobs_binary, key=lambda x: (-x[1], x[0]))
+    
+        V = {0}
+        self.nodes.add(0)
+    
+        for jid, p in jobs_sorted:
+            new_nodes = set()
+            for j in sorted(V):          # every existing node except T
+                if j + p <= T:
+                    arc = (j, j + p, jid)
+                    self.item_arcs.append(arc)
+                    new_nodes.add(j + p)
+                    self.nodes.add(j + p)
+            V |= new_nodes
+            # If no arc was created for this job, it has no last-batch arc
+            # and is forced to the reflect side via the demand constraint
+    
+        self.nodes.add(T)
+        for nd in self.nodes:
+            if nd != T:
+                self.loss_arcs.append((nd, T))
 
     def summary(self) -> str:
-        return (f"T={self.T}, nodes={len(self.nodes)}, "
+        n_jobs = len(self.jobs_binary)
+        n_types = len(self._types_sorted)
+        return (f"T={self.T}, jobs={n_jobs}, types={n_types}, nodes={len(self.nodes)}, "
                 f"item_arcs={len(self.item_arcs)}, loss_arcs={len(self.loss_arcs)}")
 
 
@@ -351,68 +373,77 @@ class ArcFlowReflectSMSP:
 
     def _add_demand_constraints(self, m: gp.Model, xi_s, xi_r, xi):
         """
-        xi=None  → phase-1 upper-bound form: reflect_flow[t] <= d[t]
-        xi given → phase-2 equality:  reflect_flow[t] + graph_flow[t] == d[t]
+        xi = None → Phase 1: reflect_flow[t] == d[t]  (upper bound)
+        xi given  → Phase 2: reflect_flow[t] + last_batch_flow[t] == d[t]
+                    where last_batch_flow[t] = sum of xi[arc] for every arc
+                    whose job has processing time t.
         """
-        inst  = self.inst; graph = self.graph
-        s_set = set(graph.S_arcs); lg = self.last_graph
+        inst  = self.inst
+        graph = self.graph
+        s_set = set(graph.S_arcs)
+        lg    = self.last_graph
+
         for t, d in inst.item_types.items():
             reflect_flow = quicksum(
                 xi_s[arc] if arc in s_set else xi_r[arc]
                 for arc in graph.Aj.get(t, []))
+
             if xi is None:
                 m.addConstr(reflect_flow == d, name=f"dem_{t}")
             else:
-                lb_flow = quicksum(xi[i, j, p] for (i, j, p) in lg.At.get(t, []))
+                # sum xi[arc] over all arcs in the last-batch graph
+                # whose associated job has processing time t
+                lb_flow = quicksum(xi[arc] for arc in lg.at_by_type.get(t, []))
                 m.addConstr(reflect_flow + lb_flow == d, name=f"dem_{t}")
+
 
     # ── last-batch graph vars ─────────────────────────────────────────────────
 
     def _add_last_batch_vars(self, m: gp.Model):
-        lg = self.last_graph; inst = self.inst
-        xi = {(i, j, p): m.addVar(vtype=GRB.INTEGER, lb=0,
-                                   ub=inst.item_types[p], name=f"xi_{i}_{j}_{p}")
-              for (i, j, p) in lg.item_arcs}
-        yi = {(i, j, p): m.addVar(vtype=GRB.BINARY, name=f"yi_{i}_{j}_{p}")
-              for (i, j, p) in lg.item_arcs}
+        lg   = self.last_graph
+        inst = self.inst
+        # xi[(node_in, node_out, job_id)] ∈ {0,1}: job placed on this arc
+        xi = {arc: m.addVar(vtype=GRB.BINARY, name=f"xi_{arc[0]}_{arc[1]}_{arc[2]}")
+              for arc in lg.item_arcs}
+        # loss arc flow: xl[(v,T)] ∈ {0,...,machines}, integer
         xl = {(u, v): m.addVar(vtype=GRB.INTEGER, lb=0, ub=self.machines,
                                 name=f"xl_{u}_{v}")
               for (u, v) in lg.loss_arcs}
-        return xi, yi, xl
+        return xi, xl          # no yi anymore
 
-    # ── last-batch constraints + Cmax via z_k ─────────────────────────────────
 
-    def _add_last_batch_constraints(self, m: gp.Model, xi, yi, xl, Cmax, z_k):
-        lg = self.last_graph; inst = self.inst
-        T  = inst.T; tc = inst.t_charge; mm = self.machines
-        M  = range(mm)
+    # 2.  _add_last_batch_constraints
+    #     Cmax linkage uses xi directly (no yi).
 
-        # xi / yi linking
-        for (i, j, p) in lg.item_arcs:
-            m.addConstr(xi[i, j, p] >= yi[i, j, p],                          name=f"lb_{i}_{j}_{p}")
-            m.addConstr(xi[i, j, p] <= inst.item_types[p] * yi[i, j, p],     name=f"ub_{i}_{j}_{p}")
+    def _add_last_batch_constraints(self, m: gp.Model, xi, xl, Cmax, z_k):
+        lg   = self.last_graph
+        inst = self.inst
+        T    = inst.T;  tc = inst.t_charge;  mm = self.machines
+        M    = range(mm)
 
-        # Per-machine Cmax
-        for k in M:
-            for (i, j, p) in lg.item_arcs:
-                m.addConstr(z_k[k] * (T + tc) + j * yi[i, j, p] <= Cmax,
-                            name=f"cmax_{k}_{i}_{j}_{p}")
+        # Cmax per machine: if job j ends at node_out * xi[arc] == 1,
+        # that machine's last batch finishes at z_k[k]*(T+tc) + node_out.
+        # Big-M linearisation: z_k[k]*(T+tc) + node_out*xi[arc] <= Cmax
+        for (i, j_node, jid) in lg.item_arcs:
+            m.addConstr(
+                z_k[0] * (T + tc) + j_node * xi[i, j_node, jid] <= Cmax,
+                name=f"cmax_{0}_{i}_{j_node}_{jid}")
 
         # Flow conservation at intermediate nodes
         for v in lg.nodes:
             if v == 0 or v == T:
                 continue
-            in_f  = quicksum(xi[i, v, p] for (i, j, p) in lg.item_arcs if j == v)
-            out_f = (quicksum(xi[v, j, p] for (i, j, p) in lg.item_arcs if i == v)
+            in_f  = quicksum(xi[i, v, jid]  for (i, j, jid) in lg.item_arcs if j == v)
+            out_f = (quicksum(xi[v, j, jid] for (i, j, jid) in lg.item_arcs if i == v)
                      + xl[v, T])
             m.addConstr(in_f == out_f, name=f"lb_flow_{v}")
 
-        # Source: exactly mm units leave (item arcs + loss arc from 0)
-        source_out = (quicksum(xi[0, j, p] for (i, j, p) in lg.item_arcs if i == 0)
+        # Source: exactly mm units leave
+        source_out = (quicksum(xi[0, j, jid] for (i, j, jid) in lg.item_arcs if i == 0)
                       + xl[0, T])
-        m.addConstr(source_out == mm, name="lb_source")
+        m.addConstr(source_out <= mm, name="lb_source")
 
-        # Sink: flow conservation enforces in_T == mm automatically,
+
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -422,7 +453,7 @@ class ArcFlowReflectSMSP:
     def _build_model_two_phase(self) -> gp.Model:
         inst = self.inst; T = inst.T; tc = inst.t_charge
 
-        m = gp.Model("SMSP_ArcFlowReflect_zk")
+        m = gp.Model("SMSP_ArcFlowReflect_zk_hybrid_binary_lb")
         m.Params.TimeLimit = self.time_limit
         m.Params.Threads   = self.threads
         m.Params.MIPGap    = 1e-6
@@ -482,12 +513,12 @@ class ArcFlowReflectSMSP:
             m.addConstr(z_k[k]<=z_k[k-1])
 
         # Last-batch graph
-        xi, yi, xl = self._add_last_batch_vars(m)
+        xi, xl = self._add_last_batch_vars(m)
         Cmax = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="Cmax")
         m.update()
 
         self._add_demand_constraints(m, xi_s, xi_r, xi)
-        self._add_last_batch_constraints(m, xi, yi, xl, Cmax, z_k)
+        self._add_last_batch_constraints(m, xi, xl, Cmax, z_k)
 
         # Global load lower bound on Cmax
         cmax_lb = math.ceil(sum(inst.jobs) / self.machines)
@@ -500,7 +531,7 @@ class ArcFlowReflectSMSP:
         m._phase2_ready    = True
 
         self._model = m; self._xi_s = xi_s; self._xi_r = xi_r
-        self._xi = xi; self._yi = yi; self._xl = xl; self._z_k = z_k; self._z_opt = z_opt
+        self._xi = xi; self._xl = xl; self._z_k = z_k; self._z_opt = z_opt
         return m
 
     # ── solve ─────────────────────────────────────────────────────────────────
@@ -548,7 +579,7 @@ class ArcFlowReflectSMSP:
 
         z_val     = (round(sum(v.X for v in self._xi_r.values()))
                      + self.inst.full_bin_count)
-        vals      = [j * v.X for (i, j, p), v in self._yi.items() if v.X > 0.5]
+        vals      = [j * v.X for (i, j, p), v in self._xi.items() if v.X > 0.5]
         last_load = max(vals) if vals else 0.0
         cmax      = m.ObjVal
         status    = "optimal" if st == GRB.OPTIMAL else "feasible"
@@ -564,16 +595,11 @@ class ArcFlowReflectSMSP:
 
     def _build_result(self, *, status, cmax, z_val, last_load,
                       lb, gap, runtime, runtime_phase1,
-                      phase1_root_gap, phase2_root_gap) -> SolverResult:
+                      phase1_root_gap, phase2_root_gap) -> "SolverResult":
         inst = self.inst
+        lg   = self.last_graph
 
-        try:
-            for v in self._model.getVars():
-                if v.X > 1e-5:
-                    print(f"{v.varName} = {v.X:.4g}")
-        except Exception:
-            pass
-
+        # ── non-last bins from reflect graph ──────────────────────────────
         xs_val      = {k: v.X for k, v in self._xi_s.items() if v.X > 0.5}
         xr_val      = {k: v.X for k, v in self._xi_r.items() if v.X > 0.5}
         bins_ptimes = _reconstruct_bins(xs_val, xr_val, self.graph)
@@ -581,12 +607,15 @@ class ArcFlowReflectSMSP:
             for _ in range(count):
                 bins_ptimes.append([t])
 
-        last_ptimes: List[int] = []
-        for (i, j, p), v in self._yi.items():
-            if v.X > 0.5:
-                last_ptimes.extend([p] * round(self._xi[i, j, p].X))
-        last_ptimes.sort()
+        # ── last bins: collect placed jobs from xi ────────────────────────
+        xi_val = {arc: v.X for arc, v in self._xi.items() if v.X > 0.5}
+        xl_val = {k:   v.X for k,   v in self._xl.items() if v.X > 0.5}
 
+        last_bins_ptimes  = _reconstruct_last_bins(xi_val, xl_val, lg)
+        while len(last_bins_ptimes) < self.machines:
+            last_bins_ptimes.append([])
+
+        # ── map processing times → original job indices ───────────────────
         full_pool: Dict[int, List[int]] = defaultdict(list)
         for idx, p in enumerate(inst.jobs):
             full_pool[p].append(idx)
@@ -597,13 +626,6 @@ class ArcFlowReflectSMSP:
                 *sorted(zip(bins_idx, bins_ptimes), key=lambda x: x[0][0]))
             bins_idx    = list(bins_idx)
             bins_ptimes = list(bins_ptimes)
-            
-        xi_val = {k: v.X for k, v in self._xi.items() if v.X > 0.5}
-        xl_val = {k: v.X for k, v in self._xl.items() if v.X > 0.5}
-
-        last_bins_ptimes = _reconstruct_last_bins(xi_val, xl_val, self.last_graph)
-        while len(last_bins_ptimes) < self.machines:
-            last_bins_ptimes.append([])
 
         last_bins_indices = [sorted(full_pool[p].pop(0) for p in pt)
                              for pt in last_bins_ptimes]
@@ -623,7 +645,8 @@ class ArcFlowReflectSMSP:
             instance=inst,
             bins_indices=bins_idx, last_indices=last_idx,
             bins_ptimes=bins_ptimes, last_ptimes=last_ptimes,
-            machine_bins=machine_bins, last_bins_ptimes=last_bins_ptimes,
+            machine_bins=machine_bins,
+            last_bins_ptimes=last_bins_ptimes,
             last_bins_indices=last_bins_indices)
 
 
@@ -632,31 +655,39 @@ class ArcFlowReflectSMSP:
 # ─────────────────────────────────────────────
 
 def _reconstruct_last_bins(xi_val, xl_val, graph: LastBatchGraph) -> List[List[int]]:
+    """
+    Reconstruct per-machine last batches from J_binary xi solution.
+
+    xi_val  : {(node_in, node_out, job_id): 1}  — only arcs with xi > 0.5
+    xl_val  : {(v, T): count}                    — loss arcs
+    Returns : list of lists of processing times, one per machine.
+    """
     T  = graph.T
     xi = defaultdict(int, {k: round(v) for k, v in xi_val.items()})
     xl = defaultdict(int, {k: round(v) for k, v in xl_val.items()})
 
-    total_flow = (sum(xi[0, j, p] for (i, j, p) in graph.item_arcs if i == 0)
-                  + xl[0, T])
-    bins: List[List[int]] = []
+    # total flow out of source = number of machines
+    total_flow = (sum(xi[0, j, jid] for (i, j, jid) in graph.item_arcs if i == 0)
+                  + xl.get((0, T), 0))
 
+    bins: List[List[int]] = []
     for _ in range(total_flow):
-        path: List[int] = []
+        path_p: List[int] = []   # processing times collected along this path
         node = 0
         while node != T:
             moved = False
-            for (i, j, p) in graph.item_arcs:
-                if i == node and xi[i, j, p] > 0:
-                    xi[i, j, p] -= 1
-                    path.append(p)
+            for (i, j, jid) in graph.item_arcs:
+                if i == node and xi[i, j, jid] > 0:
+                    p_j = next(p for (jj, p) in graph.jobs_binary if jj == jid)
+                    xi[i, j, jid] -= 1
+                    path_p.append(p_j)
                     node = j
                     moved = True
                     break
             if not moved:
-                # take loss arc to T
                 xl[node, T] -= 1
                 node = T
-        bins.append(path)
+        bins.append(path_p)
 
     bins.sort(key=sum, reverse=True)
     return bins
@@ -841,7 +872,7 @@ def run_single(fpath, csv_path=None, sol_dir=None, t_charge=0,
 #"""
 # --- Single instance run ---
 setstr = "MOD"
-file   = "L_00000001"
+file   = "L_example"
 result = run_single(
     f"Benchmark Instances/Instances/{setstr}/{file}",
     t_charge   = 0,
@@ -856,12 +887,12 @@ print(result.cmax, result.z_nonlast, result.last_load)
 folder = "MOD"
 run_folder(
     folder     = f"Benchmark Instances/Instances/{folder}/",
-    csv_path   = f"results/{folder}_results_hybrid_zk_m10_symmCheck.csv",
+    csv_path   = f"results/{folder}_results_hybrid_zk_m2_symmCheck_againTry2.csv",
     #sol_dir = f"results/{folder}_solutions_hybrid_zk_m10",
     t_charge   = 0,
     time_limit = 720.0,
     threads    = 1,
     verbose    = True,
-    machines   = 10,
+    machines   = 2,
 )
 #"""
