@@ -124,28 +124,32 @@ class LastBatchGraph:
         self._build(inst)
 
     def _build(self, inst: SMInstance):
-        T = self.T
-        types_sorted = self.types_sorted  # descending
-    
-        # reachable[lev] = set of nodes reachable using only item types at indices < lev
-        reachable: List[Set[int]] = [set() for _ in range(len(types_sorted) + 1)]
-        reachable[0].add(0)
+        T       = self.T
+        n_types = len(self.types_sorted)
+        level_nodes: Dict[int, Set[int]] = defaultdict(set)
+        level_nodes[0].add(0)
         self.nodes.add(0)
-    
-        for lev, p in enumerate(types_sorted):
-            # inherit all nodes from previous level
-            reachable[lev + 1] = set(reachable[lev])
-            # only extend from nodes that existed BEFORE this item type
-            for pos in reachable[lev]:
-                j = pos + p
-                if j <= T:
-                    arc = (pos, j, p)
-                    if arc not in self._arc_set:
-                        self._arc_set.add(arc)
-                        self.item_arcs.append(arc)
-                    self.nodes.add(j)
-                    reachable[lev + 1].add(j)
-    
+        for lev, p in enumerate(self.types_sorted):
+            frontier = list(level_nodes[lev])
+            while frontier:
+                next_frontier = []
+                for pos in frontier:
+                    j = pos + p
+                    if j <= T:
+                        arc = (pos, j, p)
+                        if arc not in self._arc_set:
+                            self._arc_set.add(arc)
+                            self.item_arcs.append(arc)
+                        if j not in level_nodes[lev]:
+                            level_nodes[lev].add(j)
+                            self.nodes.add(j)
+                            next_frontier.append(j)
+                frontier = next_frontier
+            if lev < n_types - 1:
+                for pos in level_nodes[lev]:
+                    if pos not in level_nodes[lev + 1]:
+                        level_nodes[lev + 1].add(pos)
+                        self.nodes.add(pos)
         self.nodes.add(T)
         # loss arcs: every non-sink node -> T
         for v in self.nodes:
@@ -837,7 +841,7 @@ def run_single(fpath, csv_path=None, sol_dir=None, t_charge=0,
 #"""
 # --- Single instance run ---
 setstr = "MOD"
-file   = "L_example"
+file   = "L_00000001"
 result = run_single(
     f"Benchmark Instances/Instances/{setstr}/{file}",
     t_charge   = 0,
